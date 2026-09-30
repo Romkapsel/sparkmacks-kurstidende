@@ -4,7 +4,7 @@
 -- og watcheren på PC-en laster opp. Addonen kjøper, poster og kansellerer ingenting.
 
 local ADDON = "Sparkmack"
-local VERSION = "1.8.0"
+local VERSION = "1.8.1"
 local KEEP_SCANS = 5          -- ringbuffer: de fem siste skanningene
 local BATCH = 500             -- rader per bilde når skanningen leses
 local WAIT_SECONDS = 30       -- så lenge vi venter på serveren før reserveløsningen
