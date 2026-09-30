@@ -1,0 +1,5 @@
+package-as: Sparkmack
+
+ignore:
+  - README.md
+  - .github

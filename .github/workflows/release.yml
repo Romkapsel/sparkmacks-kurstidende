@@ -1,0 +1,22 @@
+# Ny versjon: push en tag som «v1.8.0» → BigWigs-packageren bygger Sparkmack-1.8.0.zip og legger den ut som Release.
+# WowUp (og senere CurseForge/Wago) henter nye versjoner herfra.
+name: Utgivelse
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: BigWigsMods/packager@v2
+        env:
+          GITHUB_OAUTH: ${{ secrets.GITHUB_TOKEN }}
