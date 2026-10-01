@@ -2,7 +2,7 @@
 ## Title: |cffffd100Sparkmack's|r Kurstidende
 ## Notes: Finansavisen fra 1890: Sparkmack sender budet til AH etter dagens kurser og forteller deg hva du bør gjøre. Tid er penger, kompis! Hver handling krever ett klikk fra deg.
 ## Author: Daniel
-## Version: 1.13.0
+## Version: 1.13.1
 ## SavedVariables: SparkmackDB
 
 Data.lua

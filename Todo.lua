@@ -123,6 +123,11 @@ function T.build(input)
       elseif target < floorPrice then
         out[#out + 1] = copy(base, { action = "HOLD", qty = inBags, price = target, gain = 0,
           reason = "AH-prisen (" .. money(target) .. ") er under vendor-verdien. Behold eller selg til vendor." })
+      elseif item.med7 and item.med7 ~= 0 and target < item.med7 * 0.5 then
+        -- Samme vern som utleggingen: aldri under halve 7-dagers median (noen dumper)
+        out[#out + 1] = copy(base, { action = "HOLD", qty = inBags, price = target, gain = 0,
+          reason = "Billigste nå (" .. money(target + cfg.undercut) .. ") er under halve 7-dagers median ("
+            .. money(round(item.med7)) .. "). Noen dumper – vent til prisen tar seg opp." })
       else
         local cap
         if measured then cap = max(1, ceil(rate * 24 * cfg.maxStockDays))
@@ -158,6 +163,10 @@ function T.build(input)
         elseif newPrice < floorPrice then
           out[#out + 1] = copy(row, { action = "HOLD", gain = 0,
             reason = "Å matche " .. money(cheapest) .. " gir mindre enn vendor-verdien. La den stå." })
+        elseif item.med7 and item.med7 ~= 0 and newPrice < item.med7 * 0.5 then
+          out[#out + 1] = copy(row, { action = "HOLD", gain = 0,
+            reason = "Å matche " .. money(cheapest) .. " er under halve 7-dagers median (" .. money(round(item.med7))
+              .. "). Noen dumper – la den stå." })
         elseif measured and aheadQty <= rate * tLeft * 0.5 then
           out[#out + 1] = copy(row, { action = "HOLD", gain = 0,
             reason = "Bare " .. aheadQty .. " stk foran deg, ventes solgt på " .. max(1, round(aheadQty / rate)) .. " t. La den stå." })

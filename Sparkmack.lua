@@ -4,7 +4,7 @@
 -- og watcheren på PC-en laster opp. Addonen kjøper, poster og kansellerer ingenting.
 
 local ADDON = "Sparkmack"
-local VERSION = "1.13.0"
+local VERSION = "1.13.1"
 local KEEP_SCANS = 5          -- ringbuffer: de fem siste skanningene
 local BATCH = 500             -- rader per bilde når skanningen leses
 local WAIT_SECONDS = 30       -- så lenge vi venter på serveren før reserveløsningen
@@ -151,6 +151,29 @@ local idleStatus, statusTicker   -- statuslinja når ingenting skjer; settes len
 local fresh = {}
 local priceCheck              -- søket som venter på svar fra serveren
 local updateOpenButton           -- knappen ved AH som åpner avisen igjen; settes lenger ned
+-- Linjer i et tekstfelt (heltall, så plasseringen ikke hopper når avisen skaleres)
+local function textLines(fs)
+  local t = fs.GetText and fs:GetText()
+  if not t or t == "" then return 0 end
+  local n = fs.GetNumLines and fs:GetNumLines()
+  return (type(n) == "number" and n >= 1) and n or 1
+end
+
+-- Statusteksten og framdriftsstreken under den sentreres sammen midt på «Send ut budet»-knappene
+local STATUS_MID, STATUS_LINE_H = -140, 14
+local function layoutStatus()
+  local st, track = ui.status, ui.track
+  if not (st and track and ui.todo) then return end
+  local busy = track:IsShown()
+  local textH = math.max(1, textLines(st)) * STATUS_LINE_H
+  local total = textH + (busy and 8 or 0)
+  local top = STATUS_MID + total / 2
+  st:ClearAllPoints()
+  st:SetPoint("TOPLEFT", ui.todo, "TOPLEFT", 16, top)
+  track:ClearAllPoints()
+  track:SetPoint("TOPLEFT", ui.todo, "TOPLEFT", 16, top - textH - 4)
+end
+
 local function setStatus(text, progress)
   if ui.status then ui.status:SetText(text) end
   if ui.bar and progress then
@@ -158,6 +181,7 @@ local function setStatus(text, progress)
     local busy = progress > 0 and progress < 1
     for _, x in ipairs({ ui.bar, ui.track }) do if busy then x:Show() else x:Hide() end end
   end
+  layoutStatus()
 end
 
 -- ── Varedata ─────────────────────────────────────────────────────────────
@@ -1144,18 +1168,33 @@ end
 
 -- ── Sparkmack's Kurstidende: eget, flyttbart vindu i stil med en finansavis fra 1890 ──
 -- Faner: NYHETER (rådene) og TIL AUKSJON (dine auksjoner). Plassering huskes i SparkmackDB.ui.
-local ROWS_PER_PAGE = 7
-local ROW_H = 72          -- høyeste notis; lavere notiser blir lavere, så luften over og under streken er lik
-local ROW_PAD = 8         -- luft over og under innholdet i en notis (= over og under streken mellom dem)
+local ROWS_PER_PAGE = 6
+local ROW_H = 84          -- plass per notis på en side (6 × 84); hver notis er så høy som innholdet + luft
+local ROW_PAD = 10        -- luft over og under innholdet i en notis (= over og under streken mellom dem)
+local BTN_W, BTN_H = 108, 30   -- «Legg ut» / «Kanseller»
 local CAP_GAP = 2         -- fra toppen av tekstfeltet til toppen av bokstavene: ikonet flukter med teksten
-local TOP_ROWS = 214      -- første notis starter her (under linja med antall råd)
+local TOP_ROWS = 218      -- første notis starter her (under linja med antall råd)
 local GAZETTE_W = 500
 local INK = { 0.17, 0.11, 0.05 }          -- blekk
 local INK_SOFT = { 0.36, 0.27, 0.16 }     -- blekk, dempet
 local PAPER = { 0.86, 0.79, 0.63 }        -- avispapir
 -- Morpheus bare i avishodet og seksjonstitlene: der er det pynt. Alt med tall, varenavn og store bokstaver står i
 -- Friz Quadrata – i Morpheus ligner S på 8.
-local HEAD_FONT = "Fonts\\MORPHEUS.TTF"
+local HEAD_FONT = "Fonts\\MORPHEUS.TTF"   -- bare avisnavnet, som frakturen øverst på en gammel avis
+-- Rubrikker (sidetitler, seksjoner, faner): Nimrod – WoWs egen avis-serif – i versaler, som overskriftene i en
+-- avis fra 1890. Mangler den i klienten, Friz Quadrata (en ukjent fontsti gir usynlig tekst).
+local function firstFont(candidates)
+  if not GetFileIDFromPath then return candidates[#candidates] end
+  for _, f in ipairs(candidates) do
+    local ok, id = pcall(GetFileIDFromPath, f)
+    if ok and id then return f end
+  end
+  return candidates[#candidates]
+end
+local TITLE_FONT = firstFont({ "Fonts\\NIM_____.ttf", "Fonts\\FRIZQT__.TTF" })
+-- Skriftskala: avisnavn 33 (Morpheus) · sidetittel 26 · rubrikk og faner 16 · varenavn 15 (forsiden) / 14 (side 2–3)
+-- · merkelapp 12 – alt i Nimrod. Tall og detaljer i Friz Quadrata: pris 13, grunn 11.
+local SIZE = { page = 26, rubric = 16, headline = 15, smallHeadline = 14, tag = 12 }
 local BODY_FONT = "Fonts\\FRIZQT__.TTF"
 local OXBLOOD = { 0.48, 0.1, 0.06 }       -- hover: dyp rød blekk
 local ACTION_TEXT = { POST = "|cff1d5a1dLEGG UT|r", REPOST = "|cff1d3f78OMPRIS|r", HOLD = "|cff5a4a3aLA STÅ|r" }
@@ -1207,33 +1246,72 @@ local function datelineText(md, scanRec)
   return ("Nr. %d  ·  %s  ·  %s  ·  Pris 1 kobber"):format(DB.scanCount or 0, d, kurs)
 end
 
+-- Knapp som en annonseramme i avisen: tykk ytre strek, tynn indre linje og svak trykksverte i bunnen.
+-- Hover: oksblod med papirfarget tekst. Valgfritt tresnitt-ikon til venstre (b:SetIcon).
 local function inkButton(parent, name, w, h, text, size)
   local b = CreateFrame("Button", name, parent)
   b:SetSize(w, h)
   b.bg = b:CreateTexture(nil, "BACKGROUND")
   b.bg:SetAllPoints(b)
-  b.bg:SetColorTexture(INK[1], INK[2], INK[3], 0)
-  for _, side in ipairs({ "TOP", "BOTTOM", "LEFT", "RIGHT" }) do
-    local e = b:CreateTexture(nil, "BORDER")
-    if side == "TOP" or side == "BOTTOM" then
-      e:SetPoint(side .. "LEFT", b, side .. "LEFT", 0, 0) e:SetPoint(side .. "RIGHT", b, side .. "RIGHT", 0, 0) e:SetHeight(1)
-    else
-      e:SetPoint("TOP" .. side, b, "TOP" .. side, 0, 0) e:SetPoint("BOTTOM" .. side, b, "BOTTOM" .. side, 0, 0) e:SetWidth(1)
+  local function frameLines(inset, thick, alpha)
+    local lines = {}
+    for _, side in ipairs({ "TOP", "BOTTOM", "LEFT", "RIGHT" }) do
+      local e = b:CreateTexture(nil, "BORDER")
+      if side == "TOP" or side == "BOTTOM" then
+        local y = side == "TOP" and -inset or inset
+        e:SetPoint(side .. "LEFT", b, side .. "LEFT", inset, y) e:SetPoint(side .. "RIGHT", b, side .. "RIGHT", -inset, y)
+        e:SetHeight(thick)
+      else
+        local x = side == "LEFT" and inset or -inset
+        e:SetPoint("TOP" .. side, b, "TOP" .. side, x, -inset) e:SetPoint("BOTTOM" .. side, b, "BOTTOM" .. side, x, inset)
+        e:SetWidth(thick)
+      end
+      e:SetColorTexture(INK[1], INK[2], INK[3], alpha)
+      lines[#lines + 1] = e
     end
-    e:SetColorTexture(INK[1], INK[2], INK[3], 0.9)
+    return lines
   end
+  frameLines(0, 2, 0.9)
+  b.inner = frameLines(4, 1, 0.55)
   local fs = b:CreateFontString(nil, "OVERLAY")
-  font(fs, BODY_FONT, (size or 14) - 3, INK)
+  font(fs, TITLE_FONT, (size or 14) - 1, INK)
   fs:SetPoint("CENTER", b, "CENTER", 0, 0)
   if b.SetFontString then b:SetFontString(fs) end
   b.label = fs
+  b.icon = b:CreateTexture(nil, "ARTWORK")
+  b.icon:SetSize(h - 12, h - 12)
+  b.icon:SetPoint("LEFT", b, "LEFT", 9, 0)
+  if b.icon.SetDesaturated then b.icon:SetDesaturated(true) end
+  if b.icon.SetMask then pcall(b.icon.SetMask, b.icon, "Interface\\CharacterFrame\\TempPortraitAlphaMask") end
+  b.icon:Hide()
   local function paint(hot)
+    local text, line = hot and PAPER or INK, hot and PAPER or INK
     if hot then
       b.bg:SetColorTexture(OXBLOOD[1], OXBLOOD[2], OXBLOOD[3], 0.95)
-      fs:SetTextColor(PAPER[1], PAPER[2], PAPER[3])
+      b.icon:SetVertexColor(PAPER[1], PAPER[2], PAPER[3])
     else
-      b.bg:SetColorTexture(INK[1], INK[2], INK[3], 0)
-      fs:SetTextColor(INK[1], INK[2], INK[3])
+      b.bg:SetColorTexture(0.45, 0.33, 0.18, 0.14)   -- svak trykksverte
+      b.icon:SetVertexColor(0.55, 0.38, 0.2)
+    end
+    fs:SetTextColor(text[1], text[2], text[3])
+    for _, e in ipairs(b.inner) do e:SetColorTexture(line[1], line[2], line[3], hot and 0.7 or 0.55) end
+  end
+  -- Ikon til venstre (tresnitt i blekkbrunt), eller nil for bare tekst. Teksten sentreres i plassen som er igjen.
+  function b:SetIcon(tex)
+    fs:ClearAllPoints()
+    -- En sti spillet ikke kjenner krasjer beta-klienten (ASSERT fileDataID) i stedet for å vise et tomt ikon:
+    -- sjekk stien først, og vis bare tekst hvis den ikke finnes.
+    if type(tex) == "string" and GetFileIDFromPath then
+      local ok, id = pcall(GetFileIDFromPath, tex)
+      if not (ok and id) then tex = nil end
+    end
+    if tex then
+      b.icon:SetTexture(tex)
+      b.icon:Show()
+      fs:SetPoint("CENTER", b, "CENTER", (h - 12) / 2 + 2, 0)
+    else
+      b.icon:Hide()
+      fs:SetPoint("CENTER", b, "CENTER", 0, 0)
     end
   end
   b:SetScript("OnEnter", function()
@@ -1241,9 +1319,12 @@ local function inkButton(parent, name, w, h, text, size)
     if b.onHover then pcall(b.onHover) end
   end)
   b:SetScript("OnLeave", function() paint(b.locked) end)
+  b:SetScript("OnMouseDown", function() if b:IsEnabled() ~= false then b.label:SetPoint("CENTER", b, "CENTER", b.icon:IsShown() and ((h - 12) / 2 + 3) or 1, -1) end end)
+  b:SetScript("OnMouseUp", function() b:SetIcon(b.icon:IsShown() and b.icon:GetTexture() or nil) end)
   b:SetScript("OnEnable", function() b:SetAlpha(1) end)
   b:SetScript("OnDisable", function() b:SetAlpha(0.4) paint(false) end)
   b.paint = paint
+  paint(false)
   if text then b:SetText(text) end
   return b
 end
@@ -1350,6 +1431,7 @@ local function setGazetteScale(t, scale)
   end
   DB.ui = DB.ui or {}
   DB.ui.scale = scale
+  if ui.relayout and C_Timer and C_Timer.After then C_Timer.After(0, ui.relayout) end
 end
 
 -- Håndtaket: dra hjørnet, så følger hjørnet musa (width = bredden på vinduet håndtaket sitter på)
@@ -1533,17 +1615,20 @@ local function whenText(at)
   return ("%s. %d. %s %s"):format(SHORT_DAY[d.wday], d.day, (MONTH[d.month] or ""):sub(1, 3), clock)
 end
 
+-- Seksjonsrubrikk: versaler i Nimrod med dobbel strek under (tykk, så tynn), som spaltetitlene i en gammel avis
 local function sectionHead(p, text, y, x)
   x = x or 16
   local h = p:CreateFontString(nil, "OVERLAY")
-  font(h, HEAD_FONT, 18, INK)
-  h:SetPoint("TOPLEFT", p, "TOPLEFT", x, y)
+  font(h, TITLE_FONT, SIZE.rubric, INK)
+  h:SetPoint("TOPLEFT", p, "TOPLEFT", x, y - 2)
   h:SetText(text)
-  local l = p:CreateTexture(nil, "ARTWORK")
-  l:SetPoint("TOPLEFT", p, "TOPLEFT", x - 2, y - 22)
-  l:SetPoint("TOPRIGHT", p, "TOPRIGHT", -14, y - 22)
-  l:SetHeight(1)
-  l:SetColorTexture(INK[1], INK[2], INK[3], 0.85)
+  for _, l in ipairs({ { 21, 2, 0.9 }, { 25, 1, 0.7 } }) do
+    local t = p:CreateTexture(nil, "ARTWORK")
+    t:SetPoint("TOPLEFT", p, "TOPLEFT", x - 2, y - l[1])
+    t:SetPoint("TOPRIGHT", p, "TOPRIGHT", -14, y - l[1])
+    t:SetHeight(l[2])
+    t:SetColorTexture(INK[1], INK[2], INK[3], l[3])
+  end
   return h
 end
 
@@ -1557,12 +1642,12 @@ local function smallRow(p, y, name, x)
   r.icon:SetSize(24, 24)
   r.icon:SetPoint("LEFT", r, "LEFT", 0, 0)
   r.line = r:CreateFontString(nil, "OVERLAY")
-  font(r.line, BODY_FONT, 12, INK)
+  font(r.line, TITLE_FONT, SIZE.smallHeadline, INK)
   r.line:SetPoint("TOPLEFT", r, "TOPLEFT", 32, -1)
   r.line:SetWidth(w - 32)
   r.line:SetJustifyH("LEFT")
   r.reason = r:CreateFontString(nil, "OVERLAY")
-  font(r.reason, BODY_FONT, 10, INK_SOFT)
+  font(r.reason, BODY_FONT, 11, INK_SOFT)
   r.reason:SetPoint("TOPLEFT", r.line, "BOTTOMLEFT", 0, -1)
   r.reason:SetWidth(w - 32)
   r.reason:SetJustifyH("LEFT")
@@ -1589,8 +1674,8 @@ end
 -- Et avisblad med eget hode: tittel, undertittel, ornament og datolinje
 local function pageHead(p, title, subtitle)
   local mast = p:CreateFontString(nil, "OVERLAY")
-  font(mast, HEAD_FONT, 30, INK)
-  mast:SetPoint("TOP", p, "TOP", 0, -18)
+  font(mast, TITLE_FONT, SIZE.page, INK)
+  mast:SetPoint("TOP", p, "TOP", 0, -20)
   mast:SetText(title)
   local sub = p:CreateFontString(nil, "OVERLAY")
   font(sub, BODY_FONT, 10, INK_SOFT)
@@ -1603,6 +1688,16 @@ local function pageHead(p, title, subtitle)
   rule(p, -96, 1)
   rule(p, -99, 2)
   return dl
+end
+
+-- Billigste nå: en prissjekk ved AH (sekunder gammel) går foran din egen siste skanning, som går foran Data.lua.
+-- Data.lua er fra forrige opplasting og kan henge en skanning etter – f.eks. etter at du selv kjøpte kuppet.
+-- nil = ingen ute nå (vi har en skanning, og varen er ikke i den).
+local function cheapestNow(key, by, fallback)
+  local f = fresh[key]
+  if type(f) == "table" and f.listings then return f.listings[1] and f.listings[1][1] end
+  if by then return by[key] and by[key][1] and by[key][1][1] end
+  return fallback
 end
 
 -- Oppslaget: Børsen (venstre) og Hovedboken (høyre). Eget vindu; forsiden skjules mens det er oppe.
@@ -1644,13 +1739,13 @@ local function buildSpread(H)
   back:SetPoint("RIGHT", bors, "LEFT", -2, 0)
   if sp.SetClampRectInsets then sp:SetClampRectInsets(-BOOKMARK_SIZE - 2, 0, 0, 0) end   -- bokmerket skal aldri havne utenfor skjermen
   folio(bors, 2)
-  local borsDate = pageHead(bors, "Børsen", "KURSER OG KUPP FRA TORGET · BILAG TIL SPARKMACK'S KURSTIDENDE")
-  sectionHead(bors, "Kupp på torget", -110, IN)
+  local borsDate = pageHead(bors, "BØRSEN", "KURSER OG KUPP FRA TORGET · BILAG TIL SPARKMACK'S KURSTIDENDE")
+  sectionHead(bors, "KUPP PÅ TORGET", -110, IN)
   local deals = {}
   for i = 1, BORS_DEALS do deals[i] = smallRow(bors, -138 - (i - 1) * 34, "SparkmackDealRow" .. i, IN) end
   local dealsEmpty = emptyText(bors, -142, IN)
   local topY = -138 - BORS_DEALS * 34 - 10
-  sectionHead(bors, "Mest omsatt", topY, IN)
+  sectionHead(bors, "MEST OMSATT", topY, IN)
   local top = {}
   for i = 1, BORS_TOP do top[i] = smallRow(bors, topY - 28 - (i - 1) * 34, "SparkmackTopRow" .. i, IN) end
   local topEmpty = emptyText(bors, topY - 32, IN)
@@ -1659,9 +1754,9 @@ local function buildSpread(H)
   local close = CreateFrame("Button", "SparkmackSpreadClose", book, "UIPanelCloseButton")
   close:SetPoint("TOPRIGHT", book, "TOPRIGHT", 2, 2)
   close:SetScript("OnClick", function() paperSound("close") sp:Hide() DB.ui = DB.ui or {} DB.ui.gazetteHidden = true updateOpenButton() end)
-  local bookDate = pageHead(book, "Hovedboken", "SPARKMACKS HANDELSPROTOKOLL")
+  local bookDate = pageHead(book, "HOVEDBOKEN", "SPARKMACKS HANDELSPROTOKOLL")
   folio(book, 3)
-  sectionHead(book, "Ukens regnskap", -110)
+  sectionHead(book, "UKENS REGNSKAP", -110)
   local stats = {}
   for i, label in ipairs({ "I dag", "7 dager", "Solgt (7 d)", "AH-cut og tapt deposit" }) do
     local col = CreateFrame("Frame", nil, book)
@@ -1676,7 +1771,7 @@ local function buildSpread(H)
     v:SetPoint("TOPLEFT", l, "BOTTOMLEFT", 0, -3)
     stats[i] = v
   end
-  sectionHead(book, "Netto per dag", -186)
+  sectionHead(book, "NETTO PER DAG", -186)
   local chartTop, chartH = -222, 80
   local zero = book:CreateTexture(nil, "ARTWORK")
   zero:SetHeight(1)
@@ -1693,7 +1788,7 @@ local function buildSpread(H)
     day:SetPoint("TOP", book, "TOPLEFT", 16 + (i - 0.5) * slot, chartTop - chartH - 6)
     bars[i] = { bar = bar, val = val, day = day, x = 16 + (i - 0.5) * slot }
   end
-  sectionHead(book, "Siste handler", -330)
+  sectionHead(book, "SISTE HANDLER", -330)
   local trades = {}
   for i = 1, BOOK_TRADES do trades[i] = smallRow(book, -358 - (i - 1) * 34, "SparkmackLedgerRow" .. i) end
   local tradesEmpty = emptyText(book, -362)
@@ -1785,9 +1880,18 @@ local function refreshSpread()
   for _, r in ipairs(B.deals) do r:Hide() end
   for _, r in ipairs(B.top) do r:Hide() end
   local found, busy = {}, {}
+  local by = latestListings()
   for key, b in pairs(md and md.items or {}) do
-    if b[6] == "billig" or b[6] == "dump" then found[#found + 1] = { key = key, b = b, ratio = (b[7] or 0) / math.max(1, b[5] or 1) } end
-    if b[3] and b[4] and b[4] >= 2 and b[3] > 0 then busy[#busy + 1] = { key = key, b = b, perDay = b[3] / b[4] * 24 } end
+    if b[6] == "billig" or b[6] == "dump" then
+      -- Fortsatt et kupp med prisen fra nå? (samme grense som «billig»: høyst 80 % av 7-dagers median)
+      local now = cheapestNow(key, by, b[7])
+      if now and b[5] and b[5] > 0 and now <= b[5] * 0.8 then
+        found[#found + 1] = { key = key, b = b, now = now, ratio = now / b[5] }
+      end
+    end
+    if b[3] and b[4] and b[4] >= 2 and b[3] > 0 then
+      busy[#busy + 1] = { key = key, b = b, now = cheapestNow(key, by, b[7]), perDay = b[3] / b[4] * 24 }
+    end
   end
   table.sort(found, function(x, y) return x.ratio < y.ratio end)
   table.sort(busy, function(x, y) return x.perDay > y.perDay end)
@@ -1799,7 +1903,7 @@ local function refreshSpread()
     r.icon:SetTexture(itemIcon(id))
     r.itemId, r.itemKey, r.itemName = id, d.key, known[1]
     r.line:SetText(("%s  %s  %s"):format(d.b[6] == "dump" and "|cff8a2a1aDUMP|r" or "|cff1d5a1dBILLIG NÅ|r",
-      inkName(known[1] or ("Vare #" .. id), known[2]), coins(d.b[7] or 0)))
+      inkName(known[1] or ("Vare #" .. id), known[2]), coins(d.now)))
     r.reason:SetText(("7-dagers median %s · %d %% under"):format(coins(d.b[5] or 0), math.floor((1 - d.ratio) * 100 + 0.5)))
     r:Show()
   end
@@ -1811,7 +1915,8 @@ local function refreshSpread()
     r.icon:SetTexture(itemIcon(id))
     r.itemId, r.itemKey, r.itemName = id, d.key, known[1]
     r.line:SetText(("%s  ca. %d stk per døgn"):format(inkName(known[1] or ("Vare #" .. id), known[2]), math.floor(d.perDay + 0.5)))
-    r.reason:SetText(("Billigste nå %s · 7-dagers median %s"):format(coins(d.b[7] or 0), coins(d.b[5] or 0)))
+    r.reason:SetText(("%s · 7-dagers median %s"):format(d.now and ("Billigste nå " .. coins(d.now)) or "Ingen ute nå",
+      coins(d.b[5] or 0)))
     r:Show()
   end
 end
@@ -1935,18 +2040,18 @@ local function ensureTodoFrame()
     -- Redaksjonen: status, framdrift, «Send ut budet» og «Send til trykken!»
     local status = t:CreateFontString("SparkmackStatusText", "OVERLAY")
     font(status, BODY_FONT, 12, INK)
-    status:SetPoint("LEFT", t, "TOPLEFT", 16, -140)   -- midt på knappene
-    status:SetWidth(180)
+    status:SetPoint("LEFT", t, "TOPLEFT", 16, -140)   -- midt på knappene (layoutStatus finjusterer)
+    status:SetWidth(W - 168 - 118 - 16 - 8)
     status:SetJustifyH("LEFT")
     status:SetText("Klar til å sende ut budet.")
     local track = t:CreateTexture(nil, "ARTWORK")
     track:SetPoint("TOPLEFT", t, "TOPLEFT", 16, -151)
-    track:SetSize(180, 4)
+    track:SetSize(W - 168 - 118 - 16 - 8, 4)
     track:Hide()
     track:SetColorTexture(INK[1], INK[2], INK[3], 0.15)
     local bar = CreateFrame("StatusBar", "SparkmackProgressBar", t)
     bar:SetPoint("TOPLEFT", track, "TOPLEFT", 0, 0)
-    bar:SetSize(180, 4)
+    bar:SetSize(W - 168 - 118 - 16 - 8, 4)
     bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
     bar:SetStatusBarColor(OXBLOOD[1], OXBLOOD[2], OXBLOOD[3])
     bar:SetMinMaxValues(0, 1)
@@ -1975,7 +2080,7 @@ local function ensureTodoFrame()
       b.icon = engraving(b, def.icon, 20, 0.85)
       b.icon:SetPoint("LEFT", b, "LEFT", 0, 0)
       b.label = b:CreateFontString(nil, "OVERLAY")
-      font(b.label, BODY_FONT, 15, INK)
+      font(b.label, TITLE_FONT, SIZE.rubric, INK)
       b.label:SetPoint("LEFT", b, "LEFT", 26, 0)
       b.label:SetText(def.text)
       b.id = def.id
@@ -1992,9 +2097,10 @@ local function ensureTodoFrame()
     end
     local summary = t:CreateFontString(nil, "OVERLAY")
     font(summary, BODY_FONT, 11, INK_SOFT)
-    summary:SetPoint("TOP", t, "TOP", 0, -202)   -- sentrert på egen linje under fanene
+    summary:SetPoint("TOP", t, "TOP", 0, -206)   -- sentrert på egen linje under fanene
     summary:SetJustifyH("CENTER")
-    rule(t, -193, 1)
+    rule(t, -192, 2)   -- dobbel strek under fanene, som under rubrikkene på side 2–3
+    rule(t, -197, 1)
 
     local empty = t:CreateFontString(nil, "OVERLAY")
     font(empty, BODY_FONT, 13, INK)
@@ -2016,9 +2122,9 @@ local function ensureTodoFrame()
       r.icon:SetPoint("TOPLEFT", r, "TOPLEFT", 0, -ROW_PAD - CAP_GAP)
       -- «LEGG UT» / «OMPRIS» / «LA STÅ» i mindre skrift foran varenavnet
       r.tag = r:CreateFontString(nil, "OVERLAY")
-      font(r.tag, BODY_FONT, 11, INK)
+      font(r.tag, TITLE_FONT, SIZE.tag, INK)
       r.line = r:CreateFontString(nil, "OVERLAY")
-      font(r.line, BODY_FONT, 14, INK)
+      font(r.line, TITLE_FONT, SIZE.headline, INK)
       r.line:SetPoint("TOPLEFT", r, "TOPLEFT", 44, -ROW_PAD)
       r.line:SetWidth(W - 32 - 44 - 112)
       r.line:SetJustifyH("LEFT")
@@ -2037,13 +2143,13 @@ local function ensureTodoFrame()
       r.sep:SetPoint("BOTTOMRIGHT", r, "BOTTOMRIGHT", 0, 0)
       r.sep:SetHeight(1)
       r.sep:SetColorTexture(INK[1], INK[2], INK[3], 0.3)
-      r.button = inkButton(r, "SparkmackTodoButton" .. i, 104, 28, nil, 15)
+      r.button = inkButton(r, "SparkmackTodoButton" .. i, BTN_W, BTN_H, nil, 15)
       r.button:SetPoint("TOPRIGHT", r, "TOPRIGHT", 0, -ROW_PAD)
       -- Velg antall: skriv det inn (f.eks. 30 av 100). Bare for varevarer; andre varer legges ut én og én.
       -- Mens du skriver tegnes ikke lista på nytt (da ville feltet miste fokus); bare prislinja oppdateres.
       r.qtyBox = CreateFrame("Frame", nil, r)
-      r.qtyBox:SetSize(104, 20)
-      r.qtyBox:SetPoint("TOP", r.button, "BOTTOM", 0, -3)
+      r.qtyBox:SetSize(BTN_W, 20)
+      r.qtyBox:SetPoint("TOP", r.button, "BOTTOM", 0, -4)
       local edit = CreateFrame("EditBox", "SparkmackQtyEdit" .. i, r.qtyBox)
       edit:SetSize(46, 20)
       edit:SetPoint("LEFT", r.qtyBox, "LEFT", 0, 0)
@@ -2172,6 +2278,7 @@ local function fillRow(r, icon, line, reason, buttonText, onClick, itemId, itemK
   r.reason:SetText(coinify(reason or ""))
   if buttonText then
     r.button:SetText(buttonText)
+    r.button:SetIcon(buttonText == "Legg ut" and "Interface\\Icons\\INV_Misc_Bag_10" or nil)
     r.button:SetScript("OnClick", onClick)
     r.button:Enable()
     r.button:Show()
@@ -2181,11 +2288,7 @@ local function fillRow(r, icon, line, reason, buttonText, onClick, itemId, itemK
   r:Show()
 end
 
-local function stringHeight(fs, fallback)
-  local h = fs.GetStringHeight and fs:GetStringHeight()
-  if type(h) ~= "number" or h <= 0 then return fallback end
-  return h
-end
+local LINE_H = { line = 17, price = 15, reason = 13 }   -- linjehøyde for varenavn (15), pris (13) og grunn (11)
 
 -- Notisene stables med samme luft (ROW_PAD) over og under hver strek. Innholdet i en notis er tekstspalten
 -- (ikon + tre linjer) og knappespalten (knapp + antall); den laveste sentreres mot den høyeste.
@@ -2201,17 +2304,21 @@ local function layoutRows()
         local sw = r.tag.GetStringWidth and r.tag:GetStringWidth()
         tagW = (type(sw) == "number" and sw > 0 and sw or 60) + 6
       end
-      local textW = W - 32 - 44 - 112 - tagW   -- slutter 8 punkter før knappespalten (104 bred)
+      -- Med knapp slutter teksten 8 punkter før knappespalten; uten knapp går den helt ut til høyre
+      local textW = W - 32 - 44 - tagW - (r.button:IsShown() and (BTN_W + 8) or 0)
       r.line:SetWidth(textW)
       r.price:SetWidth(textW)
       r.reason:SetWidth(textW)
-      local textH = stringHeight(r.line, 16) + 3 + stringHeight(r.price, 15) + 3 + stringHeight(r.reason, 13)
+      local lineH = math.max(1, textLines(r.line)) * LINE_H.line
+      local priceH = textLines(r.price) * LINE_H.price
+      local reasonH = textLines(r.reason) * LINE_H.reason
+      local textH = lineH + 3 + priceH + 3 + reasonH
       local leftH = math.max(textH, CAP_GAP + 36)
       local colH = 0
-      if r.button:IsShown() then colH = 28 end
-      if r.qtyBox:IsShown() then colH = colH + 3 + 20 end
+      if r.button:IsShown() then colH = BTN_H end
+      if r.qtyBox:IsShown() then colH = colH + 4 + 20 end
       local h = math.max(leftH, colH)
-      local rowH = math.min(ROW_H, h + 2 * ROW_PAD)
+      local rowH = h + 2 * ROW_PAD
       local pad = (rowH - h) / 2
       local textTop = pad + (h - leftH) / 2
       r:SetHeight(rowH)
@@ -2219,8 +2326,12 @@ local function layoutRows()
       r:SetPoint("TOPLEFT", ui.todo, "TOPLEFT", 16, -y)
       r.line:ClearAllPoints()
       r.line:SetPoint("TOPLEFT", r, "TOPLEFT", 44 + tagW, -textTop)
+      r.price:ClearAllPoints()
+      r.price:SetPoint("TOPLEFT", r, "TOPLEFT", 44 + tagW, -(textTop + lineH + 3))
+      r.reason:ClearAllPoints()
+      r.reason:SetPoint("TOPLEFT", r, "TOPLEFT", 44 + tagW, -(textTop + lineH + 3 + priceH + 3))
       r.tag:ClearAllPoints()
-      r.tag:SetPoint("TOPLEFT", r, "TOPLEFT", 44, -textTop - 2.5)   -- samme grunnlinje som varenavnet (14 mot 11 pt)
+      r.tag:SetPoint("TOPLEFT", r, "TOPLEFT", 44, -textTop - 2.5)   -- samme grunnlinje som varenavnet (15 mot 12 pt)
       r.icon:ClearAllPoints()
       r.icon:SetPoint("TOPLEFT", r, "TOPLEFT", 0, -textTop - CAP_GAP)
       r.button:ClearAllPoints()
@@ -2414,6 +2525,10 @@ end
 refreshTodo = function()
   drawTodo()
   layoutRows()
+end
+ui.relayout = function()
+  layoutRows()
+  layoutStatus()
 end
 
 -- Hva statuslinja sier når budet ikke er ute og ingen handling venter på svar
