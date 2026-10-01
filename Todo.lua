@@ -132,8 +132,8 @@ function T.build(input)
         if b.net >= cfg.minGain then
           local bank = bankBy[key] and (" " .. bankBy[key] .. " til i banken.") or ""
           local reason = (cheapest ~= nil and ("1c under billigste (" .. money(cheapest) .. ").") or "Ingen andre ute – 7-dagers median.")
-            .. " " .. round(b.p * 100) .. " % sjanse for salg på " .. b.hours .. " t"
-            .. (measured and "" or " (antatt – omsetningen er ukjent ennå)") .. "."
+            .. " Varighet " .. b.hours .. " t."
+            .. (measured and "" or " Omsetningen er ukjent ennå.")
             .. (q < inBags and (" Legg ut " .. q .. " av " .. inBags .. ": mer enn ett døgns omsetning blir liggende.") or "")
             .. bank
           out[#out + 1] = copy(base, { action = "POST", qty = q, price = target, hours = b.hours, deposit = b.dep,

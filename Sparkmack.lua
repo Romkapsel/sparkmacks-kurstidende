@@ -4,7 +4,7 @@
 -- og watcheren på PC-en laster opp. Addonen kjøper, poster og kansellerer ingenting.
 
 local ADDON = "Sparkmack"
-local VERSION = "1.8.1"
+local VERSION = "1.13.0"
 local KEEP_SCANS = 5          -- ringbuffer: de fem siste skanningene
 local BATCH = 500             -- rader per bilde når skanningen leses
 local WAIT_SECONDS = 30       -- så lenge vi venter på serveren før reserveløsningen
@@ -129,9 +129,27 @@ local function parseLink(link)
 end
 
 -- ── Panelet ──────────────────────────────────────────────────────────────
-local ui = {}
+local ui = { qty = {} }   -- qty: antallet du har valgt per vare («itemId:variant»)
 local refreshTodo   -- «Å gjøre»-lista; settes lenger ned
+local recordHistory -- egen kursbok; settes lenger ned
+
+-- Beløp med gull-, sølv- og kobbermynt, slik spillet selv viser penger. Todo.lua skriver «1g 23s 45c» ord for ord
+-- likt nettsiden (paritetstesten); bokstavene byttes med mynter først når teksten vises.
+local COIN = {
+  g = "|TInterface\\MoneyFrame\\UI-GoldIcon:0:0:2:0|t",
+  s = "|TInterface\\MoneyFrame\\UI-SilverIcon:0:0:2:0|t",
+  c = "|TInterface\\MoneyFrame\\UI-CopperIcon:0:0:2:0|t",
+}
+local function coinify(text)
+  if type(text) ~= "string" then return text end
+  return (text:gsub("%f[%w](%d+)([gsc])%f[^%w]", function(n, unit) return n .. COIN[unit] end))
+end
+local function coins(copper) return coinify(SparkmackTodo.money(copper)) end
 local idleStatus, statusTicker   -- statuslinja når ingenting skjer; settes lenger ned
+-- Ferske priser: «itemId:variant» → { at = tid, listings = {{pris, antall, tidsbøtte}, …} } fra et søk på én vare
+-- (vårt eget eller Auctionators). Bare i minnet – gjelder dette AH-besøket.
+local fresh = {}
+local priceCheck              -- søket som venter på svar fra serveren
 local updateOpenButton           -- knappen ved AH som åpner avisen igjen; settes lenger ned
 local function setStatus(text, progress)
   if ui.status then ui.status:SetText(text) end
@@ -196,6 +214,10 @@ local function finishScan(aborted)
     rows = #s.lines, version = VERSION, complete = not aborted,
     data = table.concat(s.lines, "\n"),
   }
+  if recordHistory then
+    local ok, err = pcall(recordHistory, record)
+    if not ok then logError("kursbok", err) end
+  end
   table.insert(DB.scans, record)
   if not aborted and record.rows > 0 then DB.scanCount = (DB.scanCount or 0) + 1 end
   while #DB.scans > KEEP_SCANS do table.remove(DB.scans, 1) end
@@ -421,8 +443,11 @@ end
 -- Hver knapp gjør én handling på ett klikk. Ingenting skjer uten klikk.
 local listingCache = {}
 
-local function marketData()
-  local key = (GetRealmName() or "?") .. "|" .. (UnitFactionGroup("player") or "?")
+local function marketKey(realm, faction) return (realm or "?") .. "|" .. (faction or "?") end
+
+-- Grunnverdiene watcheren skrev (bare hos den som har nettsiden)
+local function dataLua()
+  local key = marketKey(GetRealmName(), UnitFactionGroup("player"))
   return SparkmackData and SparkmackData.markets and SparkmackData.markets[key]
 end
 
@@ -454,6 +479,161 @@ local function latestListings()
     listingCache.key, listingCache.by, listingCache.scan = s.key, by, s
   end
   return listingCache.by, listingCache.scan
+end
+
+-- Egen kursbok: addonen regner 7-dagers median og omsetning av sine egne skanninger, med samme metode som
+-- databasen (wow.aggregate_scan og wow.base_values). Brukes når Data.lua ikke har noe for markedet – altså hos
+-- kompiser uten watcher og nettside. Lagres per marked, per døgn (UTC), per vare som
+-- «billigste,sum av medianer,antall skanninger,solgt,minutter målt». Åtte døgn beholdes.
+local HIST_DAYS = 8
+local MIN_LEFT = { [1] = 0, [2] = 30, [3] = 120, [4] = 720 }   -- tidsbøttene: kan ikke ha utløpt før dette (min)
+
+local function previousScan(rec)
+  for i = #DB.scans, 1, -1 do
+    local p = DB.scans[i]
+    if p.realm == rec.realm and p.faction == rec.faction and p.complete and p.kind ~= "replicate-cached"
+      and p.key ~= rec.key and (p.started or 0) < rec.started then return p end
+  end
+end
+
+local function unpackDay(v)
+  local mn, ms, mc, so, gp = (v or ",,,,"):match("^([^,]*),([^,]*),([^,]*),([^,]*),([^,]*)$")
+  return tonumber(mn), tonumber(ms) or 0, tonumber(mc) or 0, tonumber(so) or 0, tonumber(gp)
+end
+
+recordHistory = function(rec)
+  if not rec.complete or rec.kind == "replicate-cached" or (rec.rows or 0) == 0 then return end
+  DB.hist = DB.hist or {}
+  local mk = marketKey(rec.realm, rec.faction)
+  local H = DB.hist[mk] or { days = {} }
+  DB.hist[mk] = H
+  if H.lastKey == rec.key then return end
+  local prev = previousScan(rec)
+  local gap = prev and math.floor((rec.started - prev.started) / 60 + 0.5)
+  if gap and gap > 24 * 60 then prev, gap = nil, nil end
+
+  -- Denne skanningen: priser per vare, og «signaturer» (vare, antall, pris) til salgsanslaget
+  local cur, curSig = {}, {}
+  eachLine(rec.data, function(line)
+    local id, v, q, p = line:match("^(%d+),([^,]*),(%d+),(%d+)")
+    if id then
+      local k = id .. ":" .. v
+      local c = cur[k]
+      if not c then c = {} cur[k] = c end
+      p = tonumber(p)
+      if p > 0 then c[#c + 1] = p end
+      if prev then local sig = k .. "|" .. tonumber(q) .. "|" .. p curSig[sig] = (curSig[sig] or 0) + 1 end
+    end
+  end)
+
+  -- Salgsanslag: forsvant siden forrige skanning og kunne ikke ha utløpt → solgt,
+  -- med mindre samme vare og antall dukket opp til en ny pris (omprising)
+  local sold = {}
+  if prev then
+    local prevSig = {}
+    eachLine(prev.data, function(line)
+      local id, v, q, p, _, tl = line:match("^(%d+),([^,]*),(%d+),(%d+),(%d+),(%d+)")
+      if id then
+        local sig = id .. ":" .. v .. "|" .. tonumber(q) .. "|" .. tonumber(p)
+        local e = prevSig[sig]
+        if not e then e = { 0, 0 } prevSig[sig] = e end
+        e[1] = e[1] + 1
+        if (MIN_LEFT[tonumber(tl)] or 0) > gap then e[2] = e[2] + 1 end
+      end
+    end)
+    local gone, fresh = {}, {}
+    for sig, e in pairs(prevSig) do
+      local n = e[2] - (curSig[sig] or 0)
+      if n > 0 then local kq = sig:match("^(.*)|") gone[kq] = (gone[kq] or 0) + n end
+    end
+    for sig, n in pairs(curSig) do
+      local e = prevSig[sig]
+      n = n - (e and e[1] or 0)
+      if n > 0 then local kq = sig:match("^(.*)|") fresh[kq] = (fresh[kq] or 0) + n end
+    end
+    for kq, n in pairs(gone) do
+      local k, q = kq:match("^(.*)|(%d+)$")
+      local left = n - math.min(n, fresh[kq] or 0)
+      if left > 0 then sold[k] = (sold[k] or 0) + left * tonumber(q) end
+    end
+  end
+
+  local day = date("!%Y-%m-%d", rec.started)
+  local D = H.days[day] or {}
+  H.days[day] = D
+  local function add(k, prices)
+    local mn, ms, mc, so, gp = unpackDay(D[k])
+    if prices and #prices > 0 then
+      table.sort(prices)
+      mn = math.min(mn or prices[1], prices[1])
+      ms, mc = ms + prices[math.ceil(#prices / 2)], mc + 1
+    end
+    if prev then so, gp = so + (sold[k] or 0), (gp or 0) + gap end
+    D[k] = (mn or "") .. "," .. ms .. "," .. mc .. "," .. so .. "," .. (gp or "")
+  end
+  for k, prices in pairs(cur) do add(k, prices) end
+  for k, n in pairs(sold) do if not cur[k] and n > 0 then add(k, nil) end end   -- utsolgt: sterkeste salgssignal
+  local oldest = date("!%Y-%m-%d", rec.started - (HIST_DAYS - 1) * 86400)
+  for d in pairs(H.days) do if d < oldest then H.days[d] = nil end end
+  H.lastKey, H.lastAt, H.version = rec.key, rec.started, (H.version or 0) + 1
+end
+
+-- Medianen slik Postgres' percentile_cont(0.5) regner den
+local function medianCont(list)
+  if #list == 0 then return nil end
+  table.sort(list)
+  local pos = (#list - 1) * 0.5 + 1
+  local lo = math.floor(pos)
+  return list[lo] + (list[math.min(lo + 1, #list)] - list[lo]) * (pos - lo)
+end
+
+-- Kursboka i samme form som Data.lua: «itemId:variant» → {vendor, stack, solgt, timer, 7-dagers median, flagg, billigste nå}
+local ownCache = {}
+local function ownMarket()
+  local mk = marketKey(GetRealmName(), UnitFactionGroup("player"))
+  local H = DB.hist and DB.hist[mk]
+  if not (H and H.lastAt and next(H.days)) then return nil end
+  if ownCache.mk == mk and ownCache.v == H.version then return ownCache.m end
+  local today = date("!%Y-%m-%d", H.lastAt)
+  local from7 = date("!%Y-%m-%d", H.lastAt - 7 * 86400)
+  local acc, ndays = {}, 0
+  for d, D in pairs(H.days) do
+    if d > from7 then ndays = ndays + 1 end
+    for k, v in pairs(D) do
+      local mn, ms, mc, so, gp = unpackDay(v)
+      local a = acc[k]
+      if not a then a = { meds = {}, mins = {}, sold = 0 } acc[k] = a end
+      if d > from7 then
+        if mc > 0 then a.meds[#a.meds + 1] = math.floor(ms / mc + 0.5) end
+        if gp then a.sold, a.gap = a.sold + so, (a.gap or 0) + gp end
+      end
+      if mn and d >= from7 and d < today then a.mins[#a.mins + 1] = mn end
+    end
+  end
+  local by = latestListings()
+  local items = {}
+  for k, a in pairs(acc) do
+    local known = DB.items[tonumber(k:match("^(%d+)"))] or {}
+    local med7 = medianCont(a.meds)
+    local minNow = by and by[k] and by[k][1] and by[k][1][1]
+    local flag
+    if #a.mins >= 3 and minNow then
+      local m = medianCont(a.mins)
+      if minNow <= m * 0.8 then flag = "billig" elseif minNow >= m * 1.25 then flag = "dyrt" end
+    end
+    items[k] = { known[3] or 0, known[4] or 0, a.gap and a.sold or nil, a.gap and math.floor(a.gap / 60 * 1000 + 0.5) / 1000 or nil,
+      med7 and math.floor(med7 * 10 + 0.5) / 10 or nil, flag, minNow }
+  end
+  local m = { own = true, days = ndays, settings = {}, items = items }
+  ownCache.mk, ownCache.v, ownCache.m = mk, H.version, m
+  return m
+end
+
+-- Data.lua når den har noe for markedet (samme tall som nettsiden), ellers egen kursbok
+local function marketData()
+  local md = dataLua()
+  if md and md.items and next(md.items) then return md end
+  return ownMarket() or md
 end
 
 -- Samme form som wow.todo_input() gir nettsiden
@@ -491,7 +671,9 @@ local function todoInput()
         reposts = reposts + 1
       end
     end
-    local item = { item_id = tonumber(id), variant = v, name = known[1], quality = known[2], listings = by[k] or {},
+    local listings = by[k] or {}
+    if fresh[k] and (not scanRec or fresh[k].at >= (scanRec.started or 0)) then listings = fresh[k].listings end
+    local item = { item_id = tonumber(id), variant = v, name = known[1], quality = known[2], listings = listings,
       reposts_24h = reposts }
     if b then  -- grunnverdier fra databasen, som nettsiden bruker
       item.vendor_price, item.sold, item.hours, item.med7 = b[1], b[3], b[4], b[5]
@@ -522,6 +704,188 @@ local function durationId(settings, hours)
     if d.hours == hours then return d.id end
   end
   return ({ [2] = 1, [8] = 2, [24] = 3 })[hours] or 3
+end
+
+-- ── Fersk pris før du legger ut ──────────────────────────────────────────
+-- Skanningen blir fort gammel. Før «Legg ut» eller «Kanseller» spør Sparkmack serveren om dagens priser på akkurat
+-- den varen (samme søk som AH-vinduet og Auctionator gjør når du trykker på en vare). Synlige råd sjekkes i bakgrunnen
+-- mens avisen er oppe; er prisen eldre enn FRESH_SECONDS når du klikker, blir klikket en prissjekk i stedet for en
+-- utlegging, og raden viser den nye prisen før du klikker igjen. Søk Auctionator gjør på varevarer fanges også opp.
+-- Spillet krever ett klikk per utlegging, og søket svarer først etter klikket – så søk og utlegging kan ikke skje
+-- i samme klikk. Derfor sjekkes prisen når musa kommer over «Legg ut» (HOVER_SECONDS), synlige råd hvert
+-- BACKGROUND_SECONDS, og et klikk legger bare ut hvis prisen er sjekket siste POST_SECONDS.
+local FRESH_SECONDS = 60       -- «Kanseller» og hva raden kaller fersk
+local POST_SECONDS = 15        -- «Legg ut»: maks alder på prisen
+local HOVER_SECONDS = 5        -- musa over «Legg ut»: sjekk på nytt hvis eldre enn dette
+local BACKGROUND_SECONDS = 30  -- synlige råd sjekkes i bakgrunnen så ofte
+local LOOKUP_TIMEOUT = 6
+local lookupQueue, tried = {}, {}
+
+local function canLookup()
+  local A = C_AuctionHouse
+  return isModern() and A and (A.SendSearchQuery or A.SendSellSearchQuery) ~= nil and A.GetNumCommoditySearchResults ~= nil
+end
+
+local function isFresh(key, maxAge)
+  return fresh[key] ~= nil and time() - fresh[key].at <= (maxAge or FRESH_SECONDS)
+end
+
+local function bandOf(seconds)
+  if not seconds then return 4 end
+  if seconds <= 1800 then return 1 elseif seconds <= 7200 then return 2 elseif seconds <= 43200 then return 3 end
+  return 4
+end
+
+local function storeFresh(key, listings)
+  table.sort(listings, function(a, b) return a[1] < b[1] end)
+  fresh[key] = { at = time(), listings = listings }
+end
+
+local function readCommodity(itemId)
+  local A, out = C_AuctionHouse, {}
+  for i = 1, (A.GetNumCommoditySearchResults(itemId) or 0) do
+    local r = A.GetCommoditySearchResultInfo(itemId, i)
+    if r and (r.unitPrice or 0) > 0 then out[#out + 1] = { r.unitPrice, r.quantity or 1, bandOf(r.timeLeftSeconds) } end
+  end
+  return out
+end
+
+-- Varer (ikke varevarer): samme vare kan ha ulike suffiks, så lenken må stemme med varianten.
+-- buyoutAmount regnes per stk, som for egne auksjoner.
+local function readItems(itemKey, variant)
+  local A, out = C_AuctionHouse, {}
+  for i = 1, (A.GetNumItemSearchResults and A.GetNumItemSearchResults(itemKey) or 0) do
+    local r = A.GetItemSearchResultInfo(itemKey, i)
+    if r and (r.buyoutAmount or 0) > 0 then
+      local _, v = parseLink(r.itemLink)
+      if not r.itemLink or (v or "0") == variant then
+        out[#out + 1] = { r.buyoutAmount, r.quantity or 1, (r.timeLeft or 3) + 1 }
+      end
+    end
+  end
+  return out
+end
+
+-- itemKey til søket: fra varen i bagen (riktig suffiks), fra egen auksjon, ellers bare vare-ID
+local function itemKeyFor(row)
+  local A = C_AuctionHouse
+  if row.action == "POST" and A.GetItemKeyFromItem then
+    local bag, slot = findInBags(row.item_id, row.variant)
+    if bag then
+      local ok, key = pcall(A.GetItemKeyFromItem, ItemLocation:CreateFromBagAndSlot(bag, slot))
+      if ok and key then return key end
+    end
+  end
+  if row.auction_id and A.GetNumOwnedAuctions then
+    for i = 1, (A.GetNumOwnedAuctions() or 0) do
+      local a = A.GetOwnedAuctionInfo(i)
+      if a and a.auctionID == row.auction_id and a.itemKey then return a.itemKey end
+    end
+  end
+  return A.MakeItemKey and A.MakeItemKey(row.item_id) or { itemID = row.item_id, itemLevel = 0, itemSuffix = 0 }
+end
+
+local sendNextLookup
+
+local function finishLookup(job, listings)
+  if priceCheck ~= job then return end
+  priceCheck = nil
+  if listings then storeFresh(job.key, listings) end
+  for _, cb in ipairs(job.done) do pcall(cb, listings ~= nil) end
+  if refreshTodo then refreshTodo() end
+  sendNextLookup()
+end
+
+sendNextLookup = function()
+  if priceCheck or scan or not ahOpen() then return end
+  local A = C_AuctionHouse
+  if A.IsThrottledMessageSystemReady and not A.IsThrottledMessageSystemReady() then
+    C_Timer.After(1, sendNextLookup)   -- serveren vil ha pust; AUCTION_HOUSE_THROTTLED_SYSTEM_READY kommer også
+    return
+  end
+  local job = table.remove(lookupQueue, 1)
+  if not job then return end
+  priceCheck = job
+  tried[job.key] = time()
+  local order = Enum and Enum.AuctionHouseSortOrder and Enum.AuctionHouseSortOrder.Price or 0
+  local send = A.SendSearchQuery or A.SendSellSearchQuery
+  local ok = pcall(send, job.itemKey, { { sortOrder = order, reverseSort = false } }, false)
+  if not ok then finishLookup(job, nil) return end
+  C_Timer.After(LOOKUP_TIMEOUT, function() finishLookup(job, nil) end)
+end
+
+-- Be om fersk pris på en rad. Klikk går først i køen; bakgrunnssjekker hopper over det som nylig er prøvd.
+local function requestPrice(row, urgent, done)
+  if not canLookup() then return false end
+  local job
+  if priceCheck and priceCheck.key == row.key then job = priceCheck end
+  for _, j in ipairs(lookupQueue) do if j.key == row.key then job = j end end
+  if not job then
+    if not urgent and tried[row.key] and time() - tried[row.key] < BACKGROUND_SECONDS then return false end
+    job = { key = row.key, itemId = row.item_id, variant = row.variant or "0", itemKey = itemKeyFor(row), done = {} }
+    if urgent then table.insert(lookupQueue, 1, job) else lookupQueue[#lookupQueue + 1] = job end
+  elseif urgent and job ~= priceCheck then
+    for i, j in ipairs(lookupQueue) do if j == job then table.remove(lookupQueue, i) break end end
+    table.insert(lookupQueue, 1, job)
+  end
+  if urgent then job.urgent = true end
+  if done then job.done[#job.done + 1] = done end
+  sendNextLookup()
+  return true
+end
+
+-- Rådene som står på siden nå: sjekk dem som har gammel pris
+local function freshenVisible()
+  if not (ui.visibleRows and ahOpen() and canLookup()) or scan then return end
+  for _, x in ipairs(ui.visibleRows) do
+    if not isFresh(x.key, BACKGROUND_SECONDS) then requestPrice(x, false) end
+  end
+end
+
+local function onSearchResults(event, arg1)
+  if not canLookup() then return end
+  local job = priceCheck
+  if event == "COMMODITY_SEARCH_RESULTS_UPDATED" then
+    local itemId = arg1
+    if not itemId then return end
+    if job and job.itemId == itemId then
+      finishLookup(job, readCommodity(itemId))
+    else   -- noen andre (AH-vinduet, Auctionator) søkte på en varevare: ta med prisen
+      storeFresh(itemId .. ":0", readCommodity(itemId))
+    end
+  elseif event == "ITEM_SEARCH_RESULTS_UPDATED" then
+    local itemKey = arg1
+    if job and itemKey and itemKey.itemID == job.itemId then finishLookup(job, readItems(itemKey, job.variant)) end
+  end
+end
+
+-- Klikk på en rad med gammel pris: sjekk prisen, vis den nye, og la neste klikk gjøre handlingen
+local function checkPending(key)
+  if priceCheck and priceCheck.key == key then return true end
+  for _, j in ipairs(lookupQueue) do if j.key == key then return true end end
+  return false
+end
+
+local function checkFirst(row, button, verb, maxAge)
+  if not canLookup() then return false end
+  -- En pris som er på vei (f.eks. fra musa over knappen) går foran den vi har: vent på den
+  if not checkPending(row.key) and isFresh(row.key, maxAge) then return false end
+  if button and button.Disable then button:Disable() end
+  local name = row.name or ("vare #" .. row.item_id)
+  setStatus("Sjekker dagens pris på " .. name .. " …", 0.5)
+  requestPrice(row, true, function(ok)
+    if button and button.Enable then button:Enable() end
+    if ok then
+      local f = fresh[row.key]
+      local cheapest = f and f.listings[1] and f.listings[1][1]
+      msg(("Fersk pris på %s: %s. Se over raden og trykk «%s» igjen – ingenting er gjort ennå.")
+        :format(name, cheapest and ("billigste nå " .. coins(cheapest)) or "ingen andre har den ute", verb))
+    else
+      msg("Fikk ikke sjekket prisen på " .. name .. " – ingenting er gjort. Prøv igjen om litt.")
+    end
+    if idleStatus then idleStatus() end
+  end)
+  return true
 end
 
 -- Handlinger mot AH. Sparkmack sier aldri at noe er gjort før spillet har bekreftet det:
@@ -556,6 +920,14 @@ local function startPending(kind, row, button, extra)
   end)
 end
 
+local function isCommodityInBags(itemId, variant)
+  local A = C_AuctionHouse
+  local bag, slot = findInBags(itemId, variant)
+  if not (bag and A and A.GetItemCommodityStatus and Enum and Enum.ItemCommodityStatus) then return false end
+  local ok, st = pcall(A.GetItemCommodityStatus, ItemLocation:CreateFromBagAndSlot(bag, slot))
+  return ok and st == Enum.ItemCommodityStatus.Commodity
+end
+
 local function bagCount(itemId, variant)
   local n = 0
   for bag = 0, (NUM_BAG_SLOTS or 4) do
@@ -585,7 +957,7 @@ local function doPost(row, settings, button)
   local item = (marketData() or {}).items and marketData().items[row.key]
   local med7 = item and item[5]
   if unit < math.ceil(vendor / (1 - cfg.ahCut)) or (med7 and unit < med7 * 0.5) then
-    msg("Stopper: " .. SparkmackTodo.money(unit) .. " er for lavt for " .. (row.name or "varen") .. ". Ingenting er lagt ut.")
+    msg("Stopper: " .. coins(unit) .. " er for lavt for " .. (row.name or "varen") .. ". Ingenting er lagt ut.")
     return false
   end
   local loc = ItemLocation:CreateFromBagAndSlot(bag, slot)
@@ -598,11 +970,11 @@ local function doPost(row, settings, button)
   elseif A.CalculateItemDeposit then dep = A.CalculateItemDeposit(loc, dur, qty) end
   dep = dep or row.deposit or 0
   if GetMoney() < dep then
-    say("broke", SparkmackTodo.money(dep), SparkmackTodo.money(GetMoney()))
+    say("broke", coins(dep), coins(GetMoney()))
     setStatus("For lite gull til depositen", 0)
     return false
   end
-  local label = ("%d × %s %s"):format(qty, row.name or ("vare #" .. row.item_id), SparkmackTodo.money(unit))
+  local label = ("%d × %s %s"):format(qty, row.name or ("vare #" .. row.item_id), coins(unit))
   startPending("post", row, button, { bagBefore = bagCount(row.item_id, row.variant), label = label, dep = dep, qty = qty })
   local needsConfirm
   if commodity then
@@ -633,7 +1005,7 @@ local function doCancel(row, button)
   if A.CanCancelAuction and not A.CanCancelAuction(row.auction_id) then msg("Den auksjonen kan ikke kanselleres nå.") return false end
   local cost = A.GetCancelCost and A.GetCancelCost(row.auction_id) or 0
   if cost > 0 and GetMoney() < cost then
-    say("broke", SparkmackTodo.money(cost), SparkmackTodo.money(GetMoney()))
+    say("broke", coins(cost), coins(GetMoney()))
     return false
   end
   startPending("cancel", row, button, { auctionID = row.auction_id, label = row.name or ("vare #" .. row.item_id) })
@@ -773,15 +1145,20 @@ end
 -- ── Sparkmack's Kurstidende: eget, flyttbart vindu i stil med en finansavis fra 1890 ──
 -- Faner: NYHETER (rådene) og TIL AUKSJON (dine auksjoner). Plassering huskes i SparkmackDB.ui.
 local ROWS_PER_PAGE = 7
-local ROW_H = 62
+local ROW_H = 72          -- høyeste notis; lavere notiser blir lavere, så luften over og under streken er lik
+local ROW_PAD = 8         -- luft over og under innholdet i en notis (= over og under streken mellom dem)
+local CAP_GAP = 2         -- fra toppen av tekstfeltet til toppen av bokstavene: ikonet flukter med teksten
+local TOP_ROWS = 214      -- første notis starter her (under linja med antall råd)
 local GAZETTE_W = 500
 local INK = { 0.17, 0.11, 0.05 }          -- blekk
 local INK_SOFT = { 0.36, 0.27, 0.16 }     -- blekk, dempet
 local PAPER = { 0.86, 0.79, 0.63 }        -- avispapir
+-- Morpheus bare i avishodet og seksjonstitlene: der er det pynt. Alt med tall, varenavn og store bokstaver står i
+-- Friz Quadrata – i Morpheus ligner S på 8.
 local HEAD_FONT = "Fonts\\MORPHEUS.TTF"
 local BODY_FONT = "Fonts\\FRIZQT__.TTF"
 local OXBLOOD = { 0.48, 0.1, 0.06 }       -- hover: dyp rød blekk
-local ACTION_TEXT = { POST = "|cff1d5a1dLEGG UT (POST)|r", REPOST = "|cff1d3f78OMPRIS (REPOST)|r", HOLD = "|cff5a4a3aLA STÅ|r" }
+local ACTION_TEXT = { POST = "|cff1d5a1dLEGG UT|r", REPOST = "|cff1d3f78OMPRIS|r", HOLD = "|cff5a4a3aLA STÅ|r" }
 local QUALITY_INK = { [0] = "5a5a5a", [1] = "2b1c0c", [2] = "1d5a1d", [3] = "10407a", [4] = "5a2080", [5] = "8a4a00" }
 local WEEKDAY = { "søndag", "mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lørdag" }
 local MONTH = { "januar", "februar", "mars", "april", "mai", "juni", "juli", "august", "september", "oktober", "november", "desember" }
@@ -846,7 +1223,7 @@ local function inkButton(parent, name, w, h, text, size)
     e:SetColorTexture(INK[1], INK[2], INK[3], 0.9)
   end
   local fs = b:CreateFontString(nil, "OVERLAY")
-  font(fs, HEAD_FONT, size or 14, INK)
+  font(fs, BODY_FONT, (size or 14) - 3, INK)
   fs:SetPoint("CENTER", b, "CENTER", 0, 0)
   if b.SetFontString then b:SetFontString(fs) end
   b.label = fs
@@ -859,7 +1236,10 @@ local function inkButton(parent, name, w, h, text, size)
       fs:SetTextColor(INK[1], INK[2], INK[3])
     end
   end
-  b:SetScript("OnEnter", function() if b:IsEnabled() ~= false then paint(true) end end)
+  b:SetScript("OnEnter", function()
+    if b:IsEnabled() ~= false then paint(true) end
+    if b.onHover then pcall(b.onHover) end
+  end)
   b:SetScript("OnLeave", function() paint(b.locked) end)
   b:SetScript("OnEnable", function() b:SetAlpha(1) end)
   b:SetScript("OnDisable", function() b:SetAlpha(0.4) paint(false) end)
@@ -868,37 +1248,31 @@ local function inkButton(parent, name, w, h, text, size)
   return b
 end
 
+-- Bla-knappen på siden av avisen: den runde, gylne pila fra spellboken, like stor som medaljongene i
+-- avishodet. text = "<" (bla tilbake) eller ">" (bla fram).
+local BOOKMARK_SIZE = 48
 local function bookmarkButton(parent, name, text)
   local b = CreateFrame("Button", name, parent)
-  b:SetSize(30, 84)
-  b.bg = b:CreateTexture(nil, "BACKGROUND")
-  b.bg:SetAllPoints(b)
-  b.bg:SetColorTexture(INK[1], INK[2], INK[3], 0.95)
-  for _, side in ipairs({ "TOP", "BOTTOM", "LEFT", "RIGHT" }) do
-    local e = b:CreateTexture(nil, "BORDER")
-    if side == "TOP" or side == "BOTTOM" then
-      e:SetPoint(side .. "LEFT", b, side .. "LEFT", 0, 0) e:SetPoint(side .. "RIGHT", b, side .. "RIGHT", 0, 0) e:SetHeight(2)
-    else
-      e:SetPoint("TOP" .. side, b, "TOP" .. side, 0, 0) e:SetPoint("BOTTOM" .. side, b, "BOTTOM" .. side, 0, 0) e:SetWidth(2)
-    end
-    e:SetColorTexture(1, 0.82, 0, 0.55)
-  end
-  local fs = b:CreateFontString(nil, "OVERLAY")
-  font(fs, HEAD_FONT, 26, PAPER)
-  fs:SetPoint("CENTER", b, "CENTER", 1, 0)
-  if b.SetFontString then b:SetFontString(fs) end
-  b.label = fs
-  b:SetScript("OnEnter", function() b.bg:SetColorTexture(OXBLOOD[1], OXBLOOD[2], OXBLOOD[3], 1) end)
-  b:SetScript("OnLeave", function() b.bg:SetColorTexture(INK[1], INK[2], INK[3], 0.95) end)
-  b:SetText(text)
+  b:SetSize(BOOKMARK_SIZE, BOOKMARK_SIZE)
+  local base = "Interface\\Buttons\\UI-SpellbookIcon-" .. (text == "<" and "Prev" or "Next") .. "Page-"
+  b.arrow = b:CreateTexture(nil, "ARTWORK")
+  b.arrow:SetAllPoints(b)
+  b.arrow:SetTexture(base .. "Up")
+  local glow = b:CreateTexture(nil, "HIGHLIGHT")
+  glow:SetAllPoints(b)
+  glow:SetTexture("Interface\\Buttons\\UI-Common-MouseHilight")
+  glow:SetBlendMode("ADD")
+  b:SetScript("OnMouseDown", function() b.arrow:SetTexture(base .. "Down") end)
+  b:SetScript("OnMouseUp", function() b.arrow:SetTexture(base .. "Up") end)
   return b
 end
 
 -- Sidetall nederst på hvert blad, som i en avis
+local FOOT_Y = 17   -- midt mellom bunnstreken (34 over kanten) og kanten
 local function folio(p, n)
   local f = p:CreateFontString(nil, "OVERLAY")
-  font(f, HEAD_FONT, 14, INK_SOFT)
-  f:SetPoint("BOTTOM", p, "BOTTOM", 0, 12)
+  font(f, BODY_FONT, 11, INK_SOFT)
+  f:SetPoint("CENTER", p, "BOTTOM", 0, FOOT_Y)
   f:SetText("— Side " .. n .. " —")
   return f
 end
@@ -953,21 +1327,140 @@ local function ornament(parent, y, inset)
   diamond("TOPRIGHT", -inset + 4, 4)
 end
 
--- Skalering: håndtak nede i høyre hjørne, eller Ctrl + musehjul. Øvre venstre hjørne står stille.
+-- Skalering: håndtak nede i høyre hjørne, eller Ctrl + musehjul – på forsiden og på oppslaget (side 2–3).
+-- Øvre venstre hjørne på det vinduet du ser på, står stille.
+local function scaleKeepingCorner(f, scale)
+  local left, top = f:GetLeft(), f:GetTop()
+  local oldEff = f:GetEffectiveScale()
+  f:SetScale(scale)
+  if left and top and oldEff then
+    local eff = f:GetEffectiveScale()
+    f:ClearAllPoints()
+    f:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", left * oldEff / eff, top * oldEff / eff)
+    return true
+  end
+end
+
 local function setGazetteScale(t, scale)
   scale = math.max(0.6, math.min(1.6, scale))
-  local left, top = t:GetLeft(), t:GetTop()
-  local oldEff = t:GetEffectiveScale()
-  t:SetScale(scale)
-  if left and top and oldEff then
-    local eff = t:GetEffectiveScale()
-    t:ClearAllPoints()
-    t:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", left * oldEff / eff, top * oldEff / eff)
-    savePosition(t)
+  if t and scaleKeepingCorner(t, scale) then savePosition(t) end
+  local sp = ui.spread
+  if sp then
+    if sp:IsShown() then scaleKeepingCorner(sp, scale) else sp:SetScale(scale) end
   end
   DB.ui = DB.ui or {}
   DB.ui.scale = scale
-  if ui.spread then ui.spread:SetScale(scale) end
+end
+
+-- Håndtaket: dra hjørnet, så følger hjørnet musa (width = bredden på vinduet håndtaket sitter på)
+local function makeGrip(parent, name, width)
+  local grip = CreateFrame("Button", name, parent)
+  grip:SetSize(16, 16)
+  grip:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -4, 4)
+  grip.tex = grip:CreateTexture(nil, "OVERLAY")
+  grip.tex:SetAllPoints(grip)
+  grip.tex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+  grip.tex:SetVertexColor(0.45, 0.32, 0.16)
+  grip:SetScript("OnMouseDown", function()
+    local x = GetCursorPosition()
+    grip.startX, grip.startScale = x, DB.ui and DB.ui.scale or 1
+    grip:SetScript("OnUpdate", function()
+      local cx = GetCursorPosition()
+      local screenW = width * UIParent:GetEffectiveScale()
+      setGazetteScale(ui.todo, grip.startScale + (cx - grip.startX) / screenW)
+    end)
+  end)
+  grip:SetScript("OnMouseUp", function() grip:SetScript("OnUpdate", nil) end)
+  return grip
+end
+
+-- Klikk på en vare: søk den opp i AH hvis det er åpent (det du ellers ville limt inn), ellers vis navnet
+-- ferdig markert, så Ctrl+C kopierer det. Addons kan ikke skrive til Windows' utklippstavle selv.
+local function itemNameOf(id, shown)
+  if shown and shown ~= "" then return shown end   -- navnet som står på raden
+  local known = id and DB.items and DB.items[id]
+  if known and known[1] then return known[1] end
+  local fn = GetItemInfo or (C_Item and C_Item.GetItemInfo)
+  return id and fn and fn(id) or nil
+end
+
+local function ahSearchBox()
+  local ah = AuctionHouseFrame
+  local bar = type(ah) == "table" and ah.IsShown and ah:IsShown() and ah.SearchBar
+  if type(bar) == "table" and type(bar.SearchBox) == "table" then return "modern", bar end
+  if type(AuctionFrame) == "table" and AuctionFrame.IsShown and AuctionFrame:IsShown() and type(BrowseName) == "table" then
+    return "legacy", BrowseName
+  end
+end
+
+local copyBox
+local function showCopyBox(name, owner)
+  if not copyBox then
+    local f = CreateFrame("Frame", "SparkmackCopyBox", UIParent)
+    f:SetSize(260, 52)
+    f:SetFrameStrata("DIALOG")
+    local bg = f:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(f)
+    bg:SetColorTexture(PAPER[1], PAPER[2], PAPER[3], 1)
+    for _, side in ipairs({ "TOP", "BOTTOM", "LEFT", "RIGHT" }) do
+      local e = f:CreateTexture(nil, "BORDER")
+      if side == "TOP" or side == "BOTTOM" then
+        e:SetPoint(side .. "LEFT", f, side .. "LEFT", 0, 0) e:SetPoint(side .. "RIGHT", f, side .. "RIGHT", 0, 0) e:SetHeight(1)
+      else
+        e:SetPoint("TOP" .. side, f, "TOP" .. side, 0, 0) e:SetPoint("BOTTOM" .. side, f, "BOTTOM" .. side, 0, 0) e:SetWidth(1)
+      end
+      e:SetColorTexture(INK[1], INK[2], INK[3], 0.9)
+    end
+    local hint = f:CreateFontString(nil, "OVERLAY")
+    font(hint, BODY_FONT, 10, INK_SOFT)
+    hint:SetPoint("TOP", f, "TOP", 0, -6)
+    hint:SetText("Ctrl+C kopierer · Enter eller Esc lukker")
+    local edit = CreateFrame("EditBox", "SparkmackCopyEdit", f)
+    edit:SetSize(240, 20)
+    edit:SetPoint("BOTTOM", f, "BOTTOM", 0, 8)
+    if edit.SetAutoFocus then edit:SetAutoFocus(false) end
+    if edit.SetJustifyH then edit:SetJustifyH("CENTER") end
+    font(edit, BODY_FONT, 13, INK)
+    local ebg = edit:CreateTexture(nil, "BACKGROUND")
+    ebg:SetAllPoints(edit)
+    ebg:SetColorTexture(1, 1, 1, 0.35)
+    -- Feltet skal bare vise navnet: skriver du i det, settes navnet tilbake
+    edit:SetScript("OnTextChanged", function(self, userInput)
+      if userInput and f.name then self:SetText(f.name) self:HighlightText() end
+    end)
+    edit:SetScript("OnEnterPressed", function() f:Hide() end)
+    edit:SetScript("OnEscapePressed", function() f:Hide() end)
+    edit:SetScript("OnEditFocusLost", function() f:Hide() end)
+    f.edit = edit
+    f:Hide()
+    copyBox = f
+  end
+  copyBox.name = name
+  copyBox:ClearAllPoints()
+  if owner then copyBox:SetPoint("BOTTOMLEFT", owner, "TOPLEFT", 40, -4) else copyBox:SetPoint("CENTER", UIParent, "CENTER", 0, 0) end
+  copyBox:Show()
+  copyBox.edit:SetText(name)
+  copyBox.edit:SetFocus()
+  copyBox.edit:HighlightText()
+end
+
+local function searchOrCopy(id, owner, shown)
+  local name = itemNameOf(id, shown)
+  if not name then return end
+  local kind, box = ahSearchBox()
+  if kind == "modern" then
+    local ah = AuctionHouseFrame
+    if ah.SetDisplayMode and AuctionHouseFrameDisplayMode and AuctionHouseFrameDisplayMode.Buy then
+      pcall(ah.SetDisplayMode, ah, AuctionHouseFrameDisplayMode.Buy)
+    end
+    box.SearchBox:SetText(name)
+    if box.StartSearch then pcall(box.StartSearch, box) end
+  elseif kind == "legacy" then
+    box:SetText(name)
+    if AuctionFrameBrowse_Search then pcall(AuctionFrameBrowse_Search) end
+  else
+    showCopyBox(name, owner)
+  end
 end
 
 -- Tooltip på varer: spillets egen, pluss kursnotering fra Kurstidende (Data.lua og siste skanning)
@@ -983,10 +1476,10 @@ local function showItemTooltip(owner, itemId, key)
   GameTooltip:AddLine(" ")
   GameTooltip:AddLine("Sparkmack's Kurstidende", 1, 0.82, 0)
   if b and b[5] then
-    GameTooltip:AddDoubleLine("7-dagers median", SparkmackTodo.money(b[5]), 0.9, 0.9, 0.9, 1, 1, 1)
+    GameTooltip:AddDoubleLine("7-dagers median", coins(b[5]), 0.9, 0.9, 0.9, 1, 1, 1)
   end
   if cheapest then
-    local line = SparkmackTodo.money(cheapest)
+    local line = coins(cheapest)
     if b and b[5] and b[5] > 0 then
       local pct = math.floor((cheapest / b[5] - 1) * 100 + 0.5)
       line = line .. (pct < 0 and ("  (" .. -pct .. " % under)") or pct > 0 and ("  (" .. pct .. " % over)") or "  (som medianen)")
@@ -998,6 +1491,7 @@ local function showItemTooltip(owner, itemId, key)
   else
     GameTooltip:AddDoubleLine("Omsetning", "ikke målt ennå", 0.9, 0.9, 0.9, 0.7, 0.7, 0.7)
   end
+  GameTooltip:AddLine(ahSearchBox() and "Klikk: søk opp varen i AH" or "Klikk: kopier navnet", 0.6, 0.6, 0.6)
   GameTooltip:Show()
 end
 
@@ -1063,7 +1557,7 @@ local function smallRow(p, y, name, x)
   r.icon:SetSize(24, 24)
   r.icon:SetPoint("LEFT", r, "LEFT", 0, 0)
   r.line = r:CreateFontString(nil, "OVERLAY")
-  font(r.line, HEAD_FONT, 14, INK)
+  font(r.line, BODY_FONT, 12, INK)
   r.line:SetPoint("TOPLEFT", r, "TOPLEFT", 32, -1)
   r.line:SetWidth(w - 32)
   r.line:SetJustifyH("LEFT")
@@ -1078,6 +1572,7 @@ local function smallRow(p, y, name, x)
     if r.itemId then showItemTooltip(r, r.itemId, r.itemKey) end
   end)
   r:SetScript("OnLeave", function() r.line:SetTextColor(INK[1], INK[2], INK[3]) hideTooltip() end)
+  r:SetScript("OnMouseUp", function(_, button) if button == "LeftButton" and r.itemId then searchOrCopy(r.itemId, r, r.itemName) end end)
   r:Hide()
   return r
 end
@@ -1146,8 +1641,8 @@ local function buildSpread(H)
   -- Børsen: tilbake-pil innenfor venstre kant, så innholdet starter litt lenger inn
   local IN = 16
   local back = bookmarkButton(bors, "SparkmackBackButton", "<")
-  back:SetPoint("RIGHT", bors, "LEFT", 1, 0)
-  if sp.SetClampRectInsets then sp:SetClampRectInsets(-30, 0, 0, 0) end   -- bokmerket skal aldri havne utenfor skjermen
+  back:SetPoint("RIGHT", bors, "LEFT", -2, 0)
+  if sp.SetClampRectInsets then sp:SetClampRectInsets(-BOOKMARK_SIZE - 2, 0, 0, 0) end   -- bokmerket skal aldri havne utenfor skjermen
   folio(bors, 2)
   local borsDate = pageHead(bors, "Børsen", "KURSER OG KUPP FRA TORGET · BILAG TIL SPARKMACK'S KURSTIDENDE")
   sectionHead(bors, "Kupp på torget", -110, IN)
@@ -1177,7 +1672,7 @@ local function buildSpread(H)
     l:SetPoint("TOPLEFT", col, "TOPLEFT", 0, 0)
     l:SetText(label)
     local v = col:CreateFontString("SparkmackStat" .. i, "OVERLAY")
-    font(v, HEAD_FONT, 17, INK)
+    font(v, BODY_FONT, 14, INK)
     v:SetPoint("TOPLEFT", l, "BOTTOMLEFT", 0, -3)
     stats[i] = v
   end
@@ -1203,6 +1698,7 @@ local function buildSpread(H)
   for i = 1, BOOK_TRADES do trades[i] = smallRow(book, -358 - (i - 1) * 34, "SparkmackLedgerRow" .. i) end
   local tradesEmpty = emptyText(book, -362)
 
+  makeGrip(book, "SparkmackSpreadGrip", GAZETTE_W * 2)
   ui.spread = sp
   ui.book = { page = book, date = bookDate, stats = stats, bars = bars, zero = zero, chartTop = chartTop, chartH = chartH,
     trades = trades, tradesEmpty = tradesEmpty }
@@ -1237,11 +1733,11 @@ local function refreshSpread()
     end
     if ago == 0 then todayNet = todayNet + (e.net or 0) end
   end
-  local function signed(v) return (v > 0 and "+" or "") .. SparkmackTodo.money(v) end
+  local function signed(v) return (v > 0 and "+" or "") .. coins(v) end
   L.stats[1]:SetText(signed(todayNet))
   L.stats[2]:SetText(signed(weekNet))
-  L.stats[3]:SetText(SparkmackTodo.money(soldWeek))
-  L.stats[4]:SetText(SparkmackTodo.money(costWeek))
+  L.stats[3]:SetText(coins(soldWeek))
+  L.stats[4]:SetText(coins(costWeek))
   local maxPos, maxNeg = 0, 0
   for i = 1, 7 do maxPos = math.max(maxPos, dayNet[i]) maxNeg = math.max(maxNeg, -dayNet[i]) end
   local span = math.max(1, maxPos + maxNeg)
@@ -1264,7 +1760,7 @@ local function refreshSpread()
     b.bar:SetHeight(h)
     b.val:ClearAllPoints()
     b.val:SetPoint(v >= 0 and "BOTTOM" or "TOP", L.page, "TOPLEFT", b.x, v >= 0 and (zeroY + h + 2) or (zeroY - h - 2))
-    b.val:SetText(v ~= 0 and SparkmackTodo.money(v) or "")
+    b.val:SetText(v ~= 0 and coins(v) or "")
     b.day:SetText(SHORT_DAY[tonumber(date("%w", now - (7 - i) * 86400)) + 1])
   end
   for _, r in ipairs(L.trades) do r:Hide() end
@@ -1273,12 +1769,12 @@ local function refreshSpread()
     local e, r = list[i], L.trades[i]
     local known = e.item_id and DB.items[e.item_id] or {}
     r.icon:SetTexture(itemIcon(e.item_id or 0))
-    r.itemId, r.itemKey = e.item_id, e.item_id and (e.item_id .. ":0")
-    local amount = e.kind == "sold" and ("+" .. SparkmackTodo.money(e.net)) or e.kind == "bought" and SparkmackTodo.money(e.net)
-      or (e.deposit and ("−" .. SparkmackTodo.money(e.deposit) .. " deposit") or "deposit ukjent")
+    r.itemId, r.itemKey, r.itemName = e.item_id, e.item_id and (e.item_id .. ":0"), e.name
+    local amount = e.kind == "sold" and ("+" .. coins(e.net)) or e.kind == "bought" and coins(e.net)
+      or (e.deposit and ("−" .. coins(e.deposit) .. " deposit") or "deposit ukjent")
     r.line:SetText(("%s  %s  %d ×   %s"):format(LEDGER_TEXT[e.kind] or e.kind, inkName(e.name, known[2]), e.qty or 1, amount))
-    local detail = e.kind == "sold" and ("Brutto %s · AH-cut %s · %s"):format(SparkmackTodo.money(e.gross), SparkmackTodo.money(e.cut), whenText(e.at))
-      or e.kind == "bought" and ("Betalt %s · %s"):format(SparkmackTodo.money(e.gross), whenText(e.at))
+    local detail = e.kind == "sold" and ("Brutto %s · AH-cut %s · %s"):format(coins(e.gross), coins(e.cut), whenText(e.at))
+      or e.kind == "bought" and ("Betalt %s · %s"):format(coins(e.gross), whenText(e.at))
       or ("Varen ligger i posten · %s"):format(whenText(e.at))
     r.reason:SetText(detail)
     r:Show()
@@ -1301,10 +1797,10 @@ local function refreshSpread()
     local id = tonumber(d.key:match("^(%d+)"))
     local known = DB.items[id] or {}
     r.icon:SetTexture(itemIcon(id))
-    r.itemId, r.itemKey = id, d.key
+    r.itemId, r.itemKey, r.itemName = id, d.key, known[1]
     r.line:SetText(("%s  %s  %s"):format(d.b[6] == "dump" and "|cff8a2a1aDUMP|r" or "|cff1d5a1dBILLIG NÅ|r",
-      inkName(known[1] or ("Vare #" .. id), known[2]), SparkmackTodo.money(d.b[7] or 0)))
-    r.reason:SetText(("7-dagers median %s · %d %% under"):format(SparkmackTodo.money(d.b[5] or 0), math.floor((1 - d.ratio) * 100 + 0.5)))
+      inkName(known[1] or ("Vare #" .. id), known[2]), coins(d.b[7] or 0)))
+    r.reason:SetText(("7-dagers median %s · %d %% under"):format(coins(d.b[5] or 0), math.floor((1 - d.ratio) * 100 + 0.5)))
     r:Show()
   end
   B.topEmpty:SetText(#busy == 0 and "Omsetningen måles når budet har vært ute minst to ganger samme døgn." or "")
@@ -1313,9 +1809,9 @@ local function refreshSpread()
     local id = tonumber(d.key:match("^(%d+)"))
     local known = DB.items[id] or {}
     r.icon:SetTexture(itemIcon(id))
-    r.itemId, r.itemKey = id, d.key
+    r.itemId, r.itemKey, r.itemName = id, d.key, known[1]
     r.line:SetText(("%s  ca. %d stk per døgn"):format(inkName(known[1] or ("Vare #" .. id), known[2]), math.floor(d.perDay + 0.5)))
-    r.reason:SetText(("Billigste nå %s · 7-dagers median %s"):format(SparkmackTodo.money(d.b[7] or 0), SparkmackTodo.money(d.b[5] or 0)))
+    r.reason:SetText(("Billigste nå %s · 7-dagers median %s"):format(coins(d.b[7] or 0), coins(d.b[5] or 0)))
     r:Show()
   end
 end
@@ -1329,7 +1825,8 @@ local function openSpread()
   ui.spread:ClearAllPoints()
   if left and top then
     local x = left - GAZETTE_W
-    if x < 30 then x = left end   -- ikke plass til Børsen og bokmerket til venstre: legg oppslaget mot høyre
+    ui.spreadRight = x < 30
+    if ui.spreadRight then x = left end   -- ikke plass til Børsen og bokmerket til venstre: legg oppslaget mot høyre
     ui.spread:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", x, top)
   else
     ui.spread:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
@@ -1340,6 +1837,15 @@ local function openSpread()
 end
 
 local function closeSpread()
+  -- Forsiden legges der Hovedboken lå (eller Børsen, hvis oppslaget lå mot høyre), med skaleringen du valgte der
+  local page = ui.spread and ui.spread:IsShown() and (ui.spreadRight and ui.bors.page or ui.book.page)
+  local left, top = page and page:GetLeft(), page and page:GetTop()
+  if left and top and ui.todo then
+    ui.todo:SetScale(DB.ui and DB.ui.scale or 1)
+    ui.todo:ClearAllPoints()
+    ui.todo:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", left, top)
+    savePosition(ui.todo)
+  end
   if ui.spread then ui.spread:Hide() end
   if ui.todo then
     ui.todo:Show()
@@ -1349,11 +1855,11 @@ end
 
 local function ensureTodoFrame()
   if not ui.todo then
-    local W, TOP_ROWS = GAZETTE_W, 218
+    local W = GAZETTE_W
     local ROWS_END = TOP_ROWS + ROWS_PER_PAGE * ROW_H
     local t = CreateFrame("Frame", "SparkmackTodoFrame", UIParent)
     t:SetSize(W, ROWS_END + 58)
-    if t.SetClampRectInsets then t:SetClampRectInsets(0, 30, 0, 0) end   -- bokmerket til høyre skal være på skjermen
+    if t.SetClampRectInsets then t:SetClampRectInsets(0, BOOKMARK_SIZE + 2, 0, 0) end   -- bokmerket til høyre skal være på skjermen
     t:SetFrameStrata("HIGH")
     t:SetClampedToScreen(true)
     t:SetMovable(true)
@@ -1392,7 +1898,7 @@ local function ensureTodoFrame()
 
     buildSpread(ROWS_END + 58)
     local turn = bookmarkButton(t, "SparkmackTurnButton", ">")
-    turn:SetPoint("LEFT", t, "RIGHT", -1, 0)
+    turn:SetPoint("LEFT", t, "RIGHT", 2, 0)
     turn:SetScript("OnClick", function() paperSound("turn") openSpread() end)
     ui.bors.back:SetScript("OnClick", function() paperSound("turn") closeSpread() end)
 
@@ -1429,12 +1935,12 @@ local function ensureTodoFrame()
     -- Redaksjonen: status, framdrift, «Send ut budet» og «Send til trykken!»
     local status = t:CreateFontString("SparkmackStatusText", "OVERLAY")
     font(status, BODY_FONT, 12, INK)
-    status:SetPoint("TOPLEFT", t, "TOPLEFT", 16, -126)
+    status:SetPoint("LEFT", t, "TOPLEFT", 16, -140)   -- midt på knappene
     status:SetWidth(180)
     status:SetJustifyH("LEFT")
     status:SetText("Klar til å sende ut budet.")
     local track = t:CreateTexture(nil, "ARTWORK")
-    track:SetPoint("TOPLEFT", t, "TOPLEFT", 16, -150)
+    track:SetPoint("TOPLEFT", t, "TOPLEFT", 16, -151)
     track:SetSize(180, 4)
     track:Hide()
     track:SetColorTexture(INK[1], INK[2], INK[3], 0.15)
@@ -1447,16 +1953,16 @@ local function ensureTodoFrame()
     bar:SetValue(0)
     bar:Hide()
     local scanButton = inkButton(t, "SparkmackScanButton", 118, 30, "Send ut budet", 16)
-    scanButton:SetPoint("TOPRIGHT", t, "TOPRIGHT", -168, -123)
+    scanButton:SetPoint("TOPRIGHT", t, "TOPRIGHT", -168, -125)
     scanButton:SetScript("OnClick", function()
       local ok, err = pcall(startScan)
       if not ok then logError("Send ut budet", err) end
     end)
     local saveButton = inkButton(t, "SparkmackSaveButton", 146, 30, "Send til trykken!", 16)
-    saveButton:SetPoint("TOPRIGHT", t, "TOPRIGHT", -16, -123)
+    saveButton:SetPoint("TOPRIGHT", t, "TOPRIGHT", -16, -125)
     saveButton:SetScript("OnClick", saveAndReload)
     ui.status, ui.bar, ui.track, ui.scan, ui.save = status, bar, track, scanButton, saveButton
-    rule(t, -164, 1)
+    rule(t, -163, 1)
 
     -- Faner med et lite tresnitt: aktiv i mørkt blekk, inaktiv dempet, oksblod på hover. Ingen strek under.
     local tabs = {}
@@ -1465,11 +1971,11 @@ local function ensureTodoFrame()
     for i, def in ipairs(tabDefs) do
       local b = CreateFrame("Button", i == 1 and "SparkmackTabTodo" or "SparkmackTabSale", t)
       b:SetSize(160, 26)
-      b:SetPoint("TOPLEFT", t, "TOPLEFT", 16 + (i - 1) * 170, -168)
+      b:SetPoint("TOPLEFT", t, "TOPLEFT", 16 + (i - 1) * 170, -167)
       b.icon = engraving(b, def.icon, 20, 0.85)
       b.icon:SetPoint("LEFT", b, "LEFT", 0, 0)
       b.label = b:CreateFontString(nil, "OVERLAY")
-      font(b.label, HEAD_FONT, 20, INK)
+      font(b.label, BODY_FONT, 15, INK)
       b.label:SetPoint("LEFT", b, "LEFT", 26, 0)
       b.label:SetText(def.text)
       b.id = def.id
@@ -1486,13 +1992,13 @@ local function ensureTodoFrame()
     end
     local summary = t:CreateFontString(nil, "OVERLAY")
     font(summary, BODY_FONT, 11, INK_SOFT)
-    summary:SetPoint("TOP", t, "TOP", 0, -199)   -- sentrert på egen linje under fanene
+    summary:SetPoint("TOP", t, "TOP", 0, -202)   -- sentrert på egen linje under fanene
     summary:SetJustifyH("CENTER")
-    rule(t, -194, 1)
+    rule(t, -193, 1)
 
     local empty = t:CreateFontString(nil, "OVERLAY")
     font(empty, BODY_FONT, 13, INK)
-    empty:SetPoint("TOPLEFT", t, "TOPLEFT", 16, -228)
+    empty:SetPoint("TOPLEFT", t, "TOPLEFT", 16, -TOP_ROWS - 10)
     empty:SetWidth(W - 32)
     empty:SetJustifyH("LEFT")
 
@@ -1507,15 +2013,23 @@ local function ensureTodoFrame()
       r.hl:SetColorTexture(0.45, 0.3, 0.12, 0)
       r.icon = r:CreateTexture(nil, "ARTWORK")
       r.icon:SetSize(36, 36)
-      r.icon:SetPoint("TOPLEFT", r, "TOPLEFT", 0, -7)
+      r.icon:SetPoint("TOPLEFT", r, "TOPLEFT", 0, -ROW_PAD - CAP_GAP)
+      -- «LEGG UT» / «OMPRIS» / «LA STÅ» i mindre skrift foran varenavnet
+      r.tag = r:CreateFontString(nil, "OVERLAY")
+      font(r.tag, BODY_FONT, 11, INK)
       r.line = r:CreateFontString(nil, "OVERLAY")
-      font(r.line, HEAD_FONT, 17, INK)
-      r.line:SetPoint("TOPLEFT", r, "TOPLEFT", 44, -5)
+      font(r.line, BODY_FONT, 14, INK)
+      r.line:SetPoint("TOPLEFT", r, "TOPLEFT", 44, -ROW_PAD)
       r.line:SetWidth(W - 32 - 44 - 112)
       r.line:SetJustifyH("LEFT")
+      r.price = r:CreateFontString(nil, "OVERLAY")
+      font(r.price, BODY_FONT, 13, INK)
+      r.price:SetPoint("TOPLEFT", r.line, "BOTTOMLEFT", 0, -3)
+      r.price:SetWidth(W - 32 - 44 - 112)
+      r.price:SetJustifyH("LEFT")
       r.reason = r:CreateFontString(nil, "OVERLAY")
-      font(r.reason, BODY_FONT, 12, INK_SOFT)
-      r.reason:SetPoint("TOPLEFT", r.line, "BOTTOMLEFT", 0, -3)
+      font(r.reason, BODY_FONT, 11, INK_SOFT)
+      r.reason:SetPoint("TOPLEFT", r.price, "BOTTOMLEFT", 0, -3)
       r.reason:SetWidth(W - 32 - 44 - 112)
       r.reason:SetJustifyH("LEFT")
       r.sep = r:CreateTexture(nil, "ARTWORK")
@@ -1524,7 +2038,54 @@ local function ensureTodoFrame()
       r.sep:SetHeight(1)
       r.sep:SetColorTexture(INK[1], INK[2], INK[3], 0.3)
       r.button = inkButton(r, "SparkmackTodoButton" .. i, 104, 28, nil, 15)
-      r.button:SetPoint("RIGHT", r, "RIGHT", 0, 4)
+      r.button:SetPoint("TOPRIGHT", r, "TOPRIGHT", 0, -ROW_PAD)
+      -- Velg antall: skriv det inn (f.eks. 30 av 100). Bare for varevarer; andre varer legges ut én og én.
+      -- Mens du skriver tegnes ikke lista på nytt (da ville feltet miste fokus); bare prislinja oppdateres.
+      r.qtyBox = CreateFrame("Frame", nil, r)
+      r.qtyBox:SetSize(104, 20)
+      r.qtyBox:SetPoint("TOP", r.button, "BOTTOM", 0, -3)
+      local edit = CreateFrame("EditBox", "SparkmackQtyEdit" .. i, r.qtyBox)
+      edit:SetSize(46, 20)
+      edit:SetPoint("LEFT", r.qtyBox, "LEFT", 0, 0)
+      if edit.SetAutoFocus then edit:SetAutoFocus(false) end
+      if edit.SetNumeric then edit:SetNumeric(true) end
+      if edit.SetMaxLetters then edit:SetMaxLetters(5) end
+      if edit.SetJustifyH then edit:SetJustifyH("CENTER") end
+      if edit.SetTextInsets then edit:SetTextInsets(2, 2, 0, 0) end
+      font(edit, BODY_FONT, 13, INK)
+      local bg = edit:CreateTexture(nil, "BACKGROUND")
+      bg:SetAllPoints(edit)
+      bg:SetColorTexture(1, 1, 1, 0.35)
+      for _, side in ipairs({ "TOP", "BOTTOM", "LEFT", "RIGHT" }) do
+        local e = edit:CreateTexture(nil, "BORDER")
+        if side == "TOP" or side == "BOTTOM" then
+          e:SetPoint(side .. "LEFT", edit, side .. "LEFT", 0, 0) e:SetPoint(side .. "RIGHT", edit, side .. "RIGHT", 0, 0) e:SetHeight(1)
+        else
+          e:SetPoint("TOP" .. side, edit, "TOP" .. side, 0, 0) e:SetPoint("BOTTOM" .. side, edit, "BOTTOM" .. side, 0, 0) e:SetWidth(1)
+        end
+        e:SetColorTexture(INK[1], INK[2], INK[3], 0.9)
+      end
+      r.qtyEdit = edit
+      r.qtyOf = r.qtyBox:CreateFontString("SparkmackQtyOf" .. i, "OVERLAY")
+      font(r.qtyOf, BODY_FONT, 12, INK_SOFT)
+      r.qtyOf:SetPoint("LEFT", edit, "RIGHT", 5, 0)
+      edit:SetScript("OnEditFocusGained", function() ui.typing = true end)
+      edit:SetScript("OnEditFocusLost", function(self)
+        ui.typing = false
+        if r.qtyNow then self:SetText(tostring(r.qtyNow)) end
+        if ui.refreshPending then ui.refreshPending = false refreshTodo() end
+      end)
+      edit:SetScript("OnTextChanged", function(self, userInput)
+        if not userInput or not r.qtyKey then return end
+        local n = tonumber(self:GetText() or "")
+        if not n or n < 1 then return end
+        n = math.min(r.qtyMax or 1, math.floor(n))
+        ui.qty[r.qtyKey] = n
+        if r.applyQty then r.applyQty(n) end
+      end)
+      edit:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+      edit:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+      r.qtyBox:Hide()
       if r.EnableMouse then r:EnableMouse(true) end
       r:SetScript("OnEnter", function()
         r.hl:SetColorTexture(0.45, 0.3, 0.12, 0.12)
@@ -1536,6 +2097,7 @@ local function ensureTodoFrame()
         r.line:SetTextColor(INK[1], INK[2], INK[3])
         hideTooltip()
       end)
+      r:SetScript("OnMouseUp", function(_, button) if button == "LeftButton" and r.itemId then searchOrCopy(r.itemId, r, r.itemName) end end)
       rows[i] = r
     end
 
@@ -1544,7 +2106,7 @@ local function ensureTodoFrame()
       local b = CreateFrame("Button", name, t)
       b:SetSize(72, 16)
       local fs = b:CreateFontString(nil, "OVERLAY")
-      font(fs, HEAD_FONT, 13, INK)
+      font(fs, BODY_FONT, 11, INK)
       fs:SetPoint("CENTER", b, "CENTER", 0, 0)
       if b.SetFontString then b:SetFontString(fs) end
       b.label = fs
@@ -1567,26 +2129,10 @@ local function ensureTodoFrame()
     folio(t, 1)
     local basis = t:CreateFontString("SparkmackBasisText", "OVERLAY")
     font(basis, BODY_FONT, 9, INK_SOFT)
-    basis:SetPoint("BOTTOMLEFT", t, "BOTTOMLEFT", 16, 14)
+    basis:SetPoint("LEFT", t, "BOTTOMLEFT", 16, FOOT_Y)
     ui.basis = basis
 
-    local grip = CreateFrame("Button", "SparkmackTodoGrip", t)
-    grip:SetSize(16, 16)
-    grip:SetPoint("BOTTOMRIGHT", t, "BOTTOMRIGHT", -4, 4)
-    grip.tex = grip:CreateTexture(nil, "OVERLAY")
-    grip.tex:SetAllPoints(grip)
-    grip.tex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
-    grip.tex:SetVertexColor(0.45, 0.32, 0.16)
-    grip:SetScript("OnMouseDown", function()
-      local x = GetCursorPosition()
-      grip.startX, grip.startScale = x, DB.ui and DB.ui.scale or 1
-      grip:SetScript("OnUpdate", function()
-        local cx = GetCursorPosition()
-        local screenW = W * UIParent:GetEffectiveScale()
-        setGazetteScale(t, grip.startScale + (cx - grip.startX) / screenW)
-      end)
-    end)
-    grip:SetScript("OnMouseUp", function() grip:SetScript("OnUpdate", nil) end)
+    makeGrip(t, "SparkmackTodoGrip", W)
 
     ui.todo, ui.todoInfo, ui.todoEmpty, ui.todoRows = t, dateline, empty, rows
     ui.tabs, ui.summary, ui.pageText, ui.prev, ui.next = tabs, summary, pageText, prev, nextb
@@ -1615,11 +2161,15 @@ local function ensureTodoFrame()
 end
 
 -- Én notis
-local function fillRow(r, icon, line, reason, buttonText, onClick, itemId, itemKey)
-  r.itemId, r.itemKey = itemId, itemKey
+local function fillRow(r, icon, line, reason, buttonText, onClick, itemId, itemKey, price, tag, name)
+  r.itemId, r.itemKey, r.itemName = itemId, itemKey, name
   r.icon:SetTexture(icon)
-  r.line:SetText(line)
-  r.reason:SetText(reason or "")
+  r.tag:SetText(tag or "")
+  r.line:SetText(coinify(line))
+  if r.price then r.price:SetText(coinify(price or "")) end
+  if r.qtyBox then r.qtyBox:Hide() r.qtyKey = nil end
+  if r.button then r.button.onHover = nil end
+  r.reason:SetText(coinify(reason or ""))
   if buttonText then
     r.button:SetText(buttonText)
     r.button:SetScript("OnClick", onClick)
@@ -1629,6 +2179,55 @@ local function fillRow(r, icon, line, reason, buttonText, onClick, itemId, itemK
     r.button:Hide()
   end
   r:Show()
+end
+
+local function stringHeight(fs, fallback)
+  local h = fs.GetStringHeight and fs:GetStringHeight()
+  if type(h) ~= "number" or h <= 0 then return fallback end
+  return h
+end
+
+-- Notisene stables med samme luft (ROW_PAD) over og under hver strek. Innholdet i en notis er tekstspalten
+-- (ikon + tre linjer) og knappespalten (knapp + antall); den laveste sentreres mot den høyeste.
+local function layoutRows()
+  if not (ui.todo and ui.todoRows) then return end
+  local W = GAZETTE_W
+  local y = TOP_ROWS
+  for _, r in ipairs(ui.todoRows) do
+    if r:IsShown() then
+      local tagText = r.tag:GetText()
+      local tagW = 0
+      if tagText and tagText ~= "" then
+        local sw = r.tag.GetStringWidth and r.tag:GetStringWidth()
+        tagW = (type(sw) == "number" and sw > 0 and sw or 60) + 6
+      end
+      local textW = W - 32 - 44 - 112 - tagW   -- slutter 8 punkter før knappespalten (104 bred)
+      r.line:SetWidth(textW)
+      r.price:SetWidth(textW)
+      r.reason:SetWidth(textW)
+      local textH = stringHeight(r.line, 16) + 3 + stringHeight(r.price, 15) + 3 + stringHeight(r.reason, 13)
+      local leftH = math.max(textH, CAP_GAP + 36)
+      local colH = 0
+      if r.button:IsShown() then colH = 28 end
+      if r.qtyBox:IsShown() then colH = colH + 3 + 20 end
+      local h = math.max(leftH, colH)
+      local rowH = math.min(ROW_H, h + 2 * ROW_PAD)
+      local pad = (rowH - h) / 2
+      local textTop = pad + (h - leftH) / 2
+      r:SetHeight(rowH)
+      r:ClearAllPoints()
+      r:SetPoint("TOPLEFT", ui.todo, "TOPLEFT", 16, -y)
+      r.line:ClearAllPoints()
+      r.line:SetPoint("TOPLEFT", r, "TOPLEFT", 44 + tagW, -textTop)
+      r.tag:ClearAllPoints()
+      r.tag:SetPoint("TOPLEFT", r, "TOPLEFT", 44, -textTop - 2.5)   -- samme grunnlinje som varenavnet (14 mot 11 pt)
+      r.icon:ClearAllPoints()
+      r.icon:SetPoint("TOPLEFT", r, "TOPLEFT", 0, -textTop - CAP_GAP)
+      r.button:ClearAllPoints()
+      r.button:SetPoint("TOPRIGHT", r, "TOPRIGHT", 0, -(pad + (h - colH) / 2))
+      y = y + rowH
+    end
+  end
 end
 
 local function pageOf(list)
@@ -1663,7 +2262,7 @@ local function saleList(input)
       if x.sold then
         x.status = "|cff1d5a1dSolgt|r – pengene venter i posten"
       elseif cheapest and cheapest < x.price then
-        x.status = "|cff8a2a1aUnderbudt|r – billigste er " .. SparkmackTodo.money(cheapest)
+        x.status = "|cff8a2a1aUnderbudt|r – billigste er " .. coins(cheapest)
       else
         x.status = "Billigst på torget"
       end
@@ -1675,7 +2274,19 @@ local function saleList(input)
   return out, total
 end
 
-refreshTodo = function()
+-- Hvor gammel prisen bak et råd er
+local function priceAge(key, scanRec)
+  if not canLookup() then return "" end
+  local f = fresh[key]
+  if f and time() - f.at <= POST_SECONDS then return "  ·  |cff1d5a1dpris sjekket nå|r" end
+  if f and time() - f.at <= FRESH_SECONDS then return "  ·  pris sjekket kl. " .. date("%H:%M:%S", f.at) .. ", sjekkes igjen" end
+  local at = f and f.at or (scanRec and scanRec.started)
+  return at and ("  ·  pris fra kl. " .. date("%H:%M", at) .. ", sjekkes før utlegging") or ""
+end
+
+local function drawTodo()
+  if ui.typing then ui.refreshPending = true return end   -- vent til du er ferdig med å skrive antall
+  ui.visibleRows = nil
   refreshSpread()
   if not ui.todo or not ui.todo:IsShown() then return end
   local input, md, scanRec = todoInput()
@@ -1683,7 +2294,11 @@ refreshTodo = function()
   for _, r in ipairs(rows) do r:Hide() end
   ui.todoInfo:SetText(datelineText(md, scanRec))
   local basis = md or marketData()   -- Data.lua finnes også før første skanning
-  if ui.basis then ui.basis:SetText(basis and ("Kursgrunnlag v" .. (basis.version or "–")) or "Kursgrunnlag mangler") end
+  if ui.basis then
+    ui.basis:SetText(not basis and "Kursgrunnlag mangler"
+      or basis.own and ("Kursgrunnlag: egne kurser, %d døgn"):format(basis.days)
+      or ("Kursgrunnlag v" .. (basis.version or "–")))
+  end
   for id, b in pairs(ui.tabs) do
     local c = id == ui.tab and INK or INK_SOFT
     b.label:SetTextColor(c[1], c[2], c[3])
@@ -1696,7 +2311,7 @@ refreshTodo = function()
 
   if ui.tab == "sale" then
     local list, total = saleList(input)
-    ui.summary:SetText(("%d auksjoner ute · verdi %s"):format(#list, SparkmackTodo.money(total)))
+    ui.summary:SetText(("%d auksjoner ute · verdi %s"):format(#list, coins(total)))
     if #list == 0 then
       ui.todoEmpty:SetText("Ingenting på auksjon. Åpne fanen «Auctions» ved AH én gang, så noterer budet dine auksjoner.")
       pageOf(list)
@@ -1705,10 +2320,10 @@ refreshTodo = function()
     local first, last = pageOf(list)
     for i = first + 1, last do
       local x = list[i]
-      fillRow(rows[i - first], itemIcon(x.item_id),
-        ("%s  %d × %s"):format(inkName(x.name or ("Vare #" .. x.item_id), x.quality), x.qty, SparkmackTodo.money(x.price)),
-        x.status .. ("  ·  %s igjen  ·  i alt %s"):format(timeLeft(x.time_left_s), SparkmackTodo.money(x.qty * x.price)),
-        nil, nil, x.item_id, x.item_id .. ":" .. x.variant)
+      fillRow(rows[i - first], itemIcon(x.item_id), inkName(x.name or ("Vare #" .. x.item_id), x.quality),
+        x.status .. ("  ·  %s igjen"):format(timeLeft(x.time_left_s)),
+        nil, nil, x.item_id, x.item_id .. ":" .. x.variant,
+        ("%d stk à %s  ·  i alt %s"):format(x.qty, coins(x.price), coins(x.qty * x.price)), nil, x.name)
     end
     return
   end
@@ -1722,40 +2337,88 @@ refreshTodo = function()
   local list = SparkmackTodo.build(input)
   local acts, gain = 0, 0
   for _, x in ipairs(list) do if x.action ~= "HOLD" then acts = acts + 1 gain = gain + x.gain end end
-  ui.summary:SetText(("%d råd · forventet %s"):format(acts, SparkmackTodo.money(gain)))
+  ui.summary:SetText(("%d råd · forventet fortjeneste %s"):format(acts, coins(gain)))
   if #list == 0 then
     ui.todoEmpty:SetText(md and "Ingenting å gjøre akkurat nå. Du er billigst, og ingenting i bagen lønner seg. Hvil vingene, kompis."
-      or "Mangler grunnverdier (Data.lua). Send til trykken, så skriver watcheren dem.")
+      or "Ingen kurser ennå. Send ut budet, kompis – Sparkmack fører kursboka selv.")
     pageOf(list)
     return
   end
   local first, last = pageOf(list)
+  ui.visibleRows = {}
   for i = first + 1, last do
     local x = list[i]
-    local price = x.action == "REPOST" and (SparkmackTodo.money(x.old_price) .. " → " .. SparkmackTodo.money(x.price))
-      or SparkmackTodo.money(x.price)
-    local line = ("%s  %s  %d × %s%s"):format(ACTION_TEXT[x.action], inkName(x.name or ("Vare #" .. x.item_id), x.quality),
-      x.qty, price, x.gain > 0 and ("  |cff1d5a1d+" .. SparkmackTodo.money(x.gain) .. "|r") or "")
+    if (x.action == "POST" or x.action == "REPOST") and not x.done then ui.visibleRows[#ui.visibleRows + 1] = x end
+    local tag = ACTION_TEXT[x.action]
+    local line = inkName(x.name or ("Vare #" .. x.item_id), x.quality)
+    local unit = x.action == "REPOST" and ("%s, ny %s"):format(coins(x.old_price), coins(x.price)) or coins(x.price)
+    local price = ("%d stk à %s"):format(x.qty, unit)
+    price = price .. "  ·  i alt " .. coins(x.qty * x.price)
     local r = rows[i - first]
     if x.action == "POST" and not x.done then
-      fillRow(r, itemIcon(x.item_id), line, x.reason, "Legg ut", function()
-        local ok, sent = pcall(doPost, x, input.settings, r.button)
+      -- Du velger antallet; forslaget er det Sparkmack tror selges. Fortjenesten skaleres med antallet.
+      local commodity = isCommodityInBags(x.item_id, x.variant)
+      local maxQ = commodity and math.max(1, bagCount(x.item_id, x.variant)) or 1
+      local post = {}
+      for k2, v2 in pairs(x) do post[k2] = v2 end
+      local function apply(q)
+        post.qty = q
+        post.gain = x.qty > 0 and math.floor(x.gain * q / x.qty + 0.5) or x.gain
+        local p, why = price, x.reason
+        if q ~= x.qty then
+          p = ("%d stk à %s"):format(q, coins(x.price))
+          p = p .. "  ·  i alt " .. coins(q * x.price)
+          why = (commodity and ("Du har valgt %d (forslag %d). "):format(q, x.qty)
+            or ("Legges ut én om gangen (forslag %d). "):format(x.qty)) .. why
+        end
+        return p, why .. priceAge(x.key, scanRec)
+      end
+      local q = math.max(1, math.min(maxQ, ui.qty[x.key] or x.qty))
+      local p, why = apply(q)
+      fillRow(r, itemIcon(x.item_id), line, why, "Legg ut", function()
+        if ui.typing and r.qtyEdit then r.qtyEdit:ClearFocus() end
+        if checkFirst(x, r.button, "Legg ut", POST_SECONDS) then return end
+        local ok, sent = pcall(doPost, post, input.settings, r.button)
         if not ok then logError("Legg ut", sent) elseif sent then r.button:Disable() end
-      end, x.item_id, x.key)
+      end, x.item_id, x.key, p, tag, x.name)
+      -- Siste prissjekk når musa kommer over «Legg ut», så klikket bruker prisen fra sekundene før
+      r.button.onHover = function()
+        if not isFresh(x.key, HOVER_SECONDS) and not checkPending(x.key) then requestPrice(x, true) end
+      end
+      if commodity and maxQ > 1 then
+        r.qtyKey, r.qtyMax, r.qtyNow = x.key, maxQ, q
+        r.applyQty = function(n)
+          r.qtyNow = n
+          local p2, why2 = apply(n)
+          r.price:SetText(coinify(p2))
+          r.reason:SetText(coinify(why2))
+          layoutRows()
+        end
+        r.qtyEdit:SetText(tostring(q))
+        r.qtyOf:SetText("av " .. maxQ)
+        r.qtyBox:Show()
+      end
     elseif x.action == "REPOST" and not x.done then
-      fillRow(r, itemIcon(x.item_id), line, x.reason, "Kanseller", function()
+      fillRow(r, itemIcon(x.item_id), line, x.reason .. priceAge(x.key, scanRec), "Kanseller", function()
+        if checkFirst(x, r.button, "Kanseller") then return end
         local ok, sent = pcall(doCancel, x, r.button)
         if not ok then logError("Kanseller", sent) elseif sent then r.button:Disable() end
-      end, x.item_id, x.key)
+      end, x.item_id, x.key, price, tag, x.name)
     else
-      fillRow(r, itemIcon(x.item_id), line, x.reason, nil, nil, x.item_id, x.key)
+      fillRow(r, itemIcon(x.item_id), line, x.reason, nil, nil, x.item_id, x.key, price, tag, x.name)
     end
   end
+  freshenVisible()
+end
+
+refreshTodo = function()
+  drawTodo()
+  layoutRows()
 end
 
 -- Hva statuslinja sier når budet ikke er ute og ingen handling venter på svar
 idleStatus = function()
-  if scan or pending or not ui.status then return end
+  if scan or pending or (priceCheck and priceCheck.urgent) or not ui.status then return end
   if DB.unsaved then
     setStatus("Ferske kurser venter – send dem til trykken!", 1)
     return
@@ -1771,11 +2434,11 @@ end
 
 statusTicker = function()
   if C_Timer.NewTicker then
-    C_Timer.NewTicker(5, function() if ui.todo and ui.todo:IsShown() then idleStatus() end end)
+    C_Timer.NewTicker(5, function() if ui.todo and ui.todo:IsShown() then idleStatus() freshenVisible() end end)
     return
   end
   C_Timer.After(5, function()   -- eldre klienter: egne tidtakere, stopper når avisen er lukket
-    if ui.todo and ui.todo:IsShown() then idleStatus() statusTicker() else ui.needTicker = true end
+    if ui.todo and ui.todo:IsShown() then idleStatus() freshenVisible() statusTicker() else ui.needTicker = true end
   end)
 end
 
@@ -1855,7 +2518,8 @@ local f = CreateFrame("Frame")
 for _, e in ipairs({ "ADDON_LOADED", "PLAYER_LOGIN", "PLAYER_LOGOUT", "AUCTION_HOUSE_SHOW", "AUCTION_HOUSE_CLOSED",
   "AUCTION_ITEM_LIST_UPDATE", "REPLICATE_ITEM_LIST_UPDATE", "GET_ITEM_INFO_RECEIVED", "OWNED_AUCTIONS_UPDATED",
   "BANKFRAME_OPENED", "BANKFRAME_CLOSED", "BAG_UPDATE_DELAYED", "UI_ERROR_MESSAGE", "AUCTION_HOUSE_AUCTION_CREATED",
-  "AUCTION_HOUSE_POST_ERROR", "AUCTION_CANCELED", "MAIL_INBOX_UPDATE" }) do
+  "AUCTION_HOUSE_POST_ERROR", "AUCTION_CANCELED", "MAIL_INBOX_UPDATE", "COMMODITY_SEARCH_RESULTS_UPDATED",
+  "ITEM_SEARCH_RESULTS_UPDATED", "AUCTION_HOUSE_THROTTLED_SYSTEM_READY" }) do
   pcall(f.RegisterEvent, f, e)
 end
 f:SetScript("OnEvent", function(_, event, ...)
@@ -1906,8 +2570,22 @@ handle = function(event, arg1, arg2)
     end
   elseif event == "BANKFRAME_OPENED" or event == "BANKFRAME_CLOSED" then
     snapshotBank()
+  elseif event == "COMMODITY_SEARCH_RESULTS_UPDATED" or event == "ITEM_SEARCH_RESULTS_UPDATED" then
+    onSearchResults(event, arg1)
+  elseif event == "AUCTION_HOUSE_THROTTLED_SYSTEM_READY" then
+    sendNextLookup()
   elseif event == "AUCTION_HOUSE_CLOSED" then
     if scan and scan.waiting then scan = nil end
+    -- Prisene og valgt antall gjelder bare mens du står ved AH
+    for k in pairs(fresh) do fresh[k] = nil end
+    for k in pairs(ui.qty) do ui.qty[k] = nil end
+    if ui.typing then
+      for _, r in ipairs(ui.todoRows or {}) do if r.qtyEdit then r.qtyEdit:ClearFocus() end end
+      ui.typing, ui.refreshPending = false, false
+    end
+    for k in pairs(tried) do tried[k] = nil end
+    for i = #lookupQueue, 1, -1 do lookupQueue[i] = nil end
+    if priceCheck then local job = priceCheck priceCheck = nil for _, cb in ipairs(job.done) do pcall(cb, false) end end
     if DB.unsaved then say("unsaved") end
   elseif event == "AUCTION_ITEM_LIST_UPDATE" or event == "REPLICATE_ITEM_LIST_UPDATE" then
     onScanData()
